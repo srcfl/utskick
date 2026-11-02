@@ -1,0 +1,62 @@
+{
+  "deploy": {
+    "worker": "utskick",
+    "publicUrl": "https://news.example.com",
+    "awsRegion": "eu-central-1",
+    "sesConfigurationSet": "utskick",
+    "d1": {
+      "name": "utskick-db",
+      "id": "00000000-0000-0000-0000-000000000000"
+    },
+    "r2": "utskick-images",
+    "signupLimiterNamespace": "1001"
+  },
+  "organization": "Example Co",
+  "homepage": "https://example.com",
+  "support": "support@example.com",
+  "lists": {
+    "newsletter": {
+      "name": "The Example Newsletter",
+      "from": "Example Co <newsletter@news.example.com>",
+      "replyTo": "hello@example.com",
+      "opens": true,
+      "fname": "there",
+      "consent": "newsletter-2026-11"
+    },
+    "product-news": {
+      "name": "Product news",
+      "from": "Example Co <product@news.example.com>",
+      "opens": false,
+      "fname": "there",
+      "consent": "product-news-2026-11"
+    }
+  },
+  "admins": [
+    "you@example.com"
+  ],
+  "testAllowlist": [
+    "you@example.com"
+  ],
+  "access": {
+    "teamDomain": "your-team.cloudflareaccess.com",
+    "audience": "the-AUD-tag-of-your-Access-application"
+  },
+  "forms": {
+    "example-web": {
+      "lists": [
+        "newsletter"
+      ],
+      "origins": [
+        "https://example.com",
+        "https://www.example.com"
+      ]
+    },
+    "example-app": {
+      "lists": [
+        "newsletter",
+        "product-news"
+      ],
+      "key": true
+    }
+  }
+}

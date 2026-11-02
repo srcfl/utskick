@@ -1,0 +1,63 @@
+{
+  "deploy": {
+    "worker": "utskick",
+    "publicUrl": "https://news.sourceful.energy",
+    "awsRegion": "eu-central-1",
+    "sesConfigurationSet": "utskick",
+    "d1": {
+      "name": "utskick-db",
+      "id": "e43b0294-fce6-4010-bb4c-08a2fd99a96c"
+    },
+    "r2": "utskick-images",
+    "signupLimiterNamespace": "7001"
+  },
+  "organization": "Sourceful Energy",
+  "homepage": "https://sourceful.energy",
+  "support": "support@sourceful.energy",
+  "lists": {
+    "the-source": {
+      "name": "The Source",
+      "from": "Sourceful Energy <the-source@news.sourceful.energy>",
+      "replyTo": "info@sourceful.energy",
+      "opens": true,
+      "fname": "👋",
+      "consent": "the-source-2026-11"
+    },
+    "ftw-news": {
+      "name": "FTW news",
+      "from": "FTW <ftw@news.sourceful.energy>",
+      "replyTo": "support@sourceful.energy",
+      "opens": false,
+      "fname": "there"
+    },
+    "ftw-box": {
+      "name": "the FTW box waitlist",
+      "from": "FTW <ftw@news.sourceful.energy>",
+      "replyTo": "support@sourceful.energy",
+      "opens": false,
+      "fname": "there"
+    }
+  },
+  "admins": [
+    "fredrik@sourceful-labs.com"
+  ],
+  "testAllowlist": [
+    "fredrik@sourceful-labs.com"
+  ],
+  "access": {
+    "teamDomain": "sourceful.cloudflareaccess.com",
+    "audience": "83aeb3bf704fc1e26213a621c0c2ed12c788e21a502f2195fb8d3d5aa906d56f"
+  },
+  "forms": {
+    "sourceful-web": {
+      "lists": [
+        "the-source"
+      ],
+      "origins": [
+        "https://sourceful.energy",
+        "https://www.sourceful.energy"
+      ],
+      "key": true
+    }
+  }
+}

@@ -1,0 +1,3 @@
+"Email Address","First Name","Last Name",Address,"Phone Number",MEMBER_RATING,OPTIN_TIME,OPTIN_IP,CONFIRM_TIME,CONFIRM_IP,LATITUDE,LONGITUDE,GMTOFF,DSTOFF,TIMEZONE,CC,REGION,UNSUB_TIME,UNSUB_CAMPAIGN_TITLE,UNSUB_CAMPAIGN_ID,UNSUB_REASON,UNSUB_REASON_OTHER,LEID,EUID,NOTES,TAGS
+gustav@example.com,Gustav,,,,1,"2020-01-01 00:00:00",,,,,,,,,,,"2025-09-10 13:20:00","Source 19",9572861,"I no longer want to receive these emails",,201,ggg,,
+fia@example.com,Fia,,,,1,"2020-01-01 00:00:00",,,,,,,,,,,"2025-09-10 13:20:00","Source 19",9572861,,,202,hhh,,

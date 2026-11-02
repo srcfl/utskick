@@ -1,0 +1,7 @@
+# Secrets for cf dev. Fake values: locally SES calls go to scripts/ses-mock.ts.
+ADMIN_TOKEN=local-admin-token
+AWS_ACCESS_KEY_ID=AKIALOCALDEV
+AWS_SECRET_ACCESS_KEY=local
+SNS_TOPIC_ARN=arn:aws:sns:eu-central-1:000000000000:utskick-events
+# {"<form>":"<key of 32+ characters>"} to try a server form locally (docs/signup.md)
+FORM_KEYS={}

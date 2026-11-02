@@ -1,0 +1,7 @@
+﻿"Email Address","First Name","Last Name",Address,"Phone Number",MEMBER_RATING,OPTIN_TIME,OPTIN_IP,CONFIRM_TIME,CONFIRM_IP,LATITUDE,LONGITUDE,GMTOFF,DSTOFF,TIMEZONE,CC,REGION,LAST_CHANGED,LEID,EUID,NOTES,TAGS
+anna@example.com,Anna,Berg,,,2,"2021-03-04 10:11:12",,"2021-03-04 10:15:00",198.51.100.7,,,,,,SE,,"2024-01-01 00:00:00",101,aaa,,
+Bo.Ek@Example.com,Bo,,,,2,"2022-05-06 07:08:09",,,,,,,,,,,"2024-01-02 00:00:00",102,bbb,,
+"carl@example.com","Carl ""CJ""","Jonsson, Jr",,,3,,,,,,,,,,,,"2023-07-08 09:10:11",103,ccc,,"""V2X"""
+dana@example.com,,,,,1,"2020-01-01 00:00:00",,,,,,,,,,,"2024-01-03 00:00:00",104,ddd,,
+erik@example.com,Erik,,,,2,"2020-02-02 00:00:00",,,,,,,,,,,"2024-01-04 00:00:00",105,eee,,
+fia@example.com,Fia,,,,2,"2020-02-03 00:00:00",,,,,,,,,,,"2024-01-04 00:00:00",106,fff,,

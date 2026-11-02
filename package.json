@@ -1,0 +1,31 @@
+{
+	"name": "utskick",
+	"version": "0.1.0",
+	"description": "Open source newsletter sender on Cloudflare Workers and Amazon SES",
+	"license": "AGPL-3.0-only",
+	"private": true,
+	"type": "module",
+	"engines": {
+		"node": ">=24"
+	},
+	"scripts": {
+		"test": "node --test test/*.test.ts",
+		"dev": "cf dev",
+		"ses-mock": "node scripts/ses-mock.ts",
+		"db:local": "node scripts/migrate-local.ts",
+		"utskick": "node cli/utskick.ts",
+		"build": "cf build",
+		"deploy": "cf deploy",
+		"deploy:sourceful": "UTSKICK_CONFIG=config/sourceful.json cf deploy",
+		"typecheck": "UTSKICK_CONFIG=${UTSKICK_CONFIG:-config/example.json} cf workers types && tsc"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "2.0.0-beta.v.10",
+		"cf": "1.0.0-beta.19",
+		"typescript": "7.0.2",
+		"vite": "8.3.5"
+	},
+	"dependencies": {
+		"aws4fetch": "1.0.20"
+	}
+}

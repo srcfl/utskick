@@ -1,0 +1,167 @@
+diff --git a/README.md b/README.md
+index 2ef3c3c..f3000fe 100644
+--- a/README.md
++++ b/README.md
+@@ -94,15 +94,18 @@ after a failed native install.
+ 
+ The home page's two forms post to `/api/signup` in `_worker.js`. It accepts
+ same-origin JSON only, checks the address, list and country, ignores a filled
+-hidden field and answers the same for a new and a known address. Rows go to a
+-D1 database bound as `SIGNUPS_DB`, kept apart from the anonymous
+-`FUTURE_DB` votes because it holds email addresses. Production and preview
+-share the EU database `ftw-signups`
+-(`32851378-602c-4b71-b3ea-69e85acff569`); its schema is `signups.sql`.
+-Without the binding the endpoint answers 503 and the forms say sign-up is
+-closed. Test only with your own address, then delete that row. Each row records the consent
+-version that `privacy.html#email` describes; change both together. Name the
+-email service in the privacy notice before the first send.
++hidden field and answers the same for a new and a known address. It then hands
++the sign-up to Utskick ([srcfl/utskick](https://github.com/srcfl/utskick)), our
++newsletter sender, through the service binding `UTSKICK`, which calls Utskick's
++`subscribe()` over RPC; the call never leaves Cloudflare and the method cannot
++be reached from the internet. The site's `news` and `gateway` lists are
++`ftw-news` and `ftw-box` there. Utskick keeps the lists in its own EU D1
++database and sends through Amazon SES in Frankfurt. Bind `UTSKICK` in
++production only: a preview deployment with the binding would sign people up for
++real. Without the binding the endpoint answers 503 and the forms say sign-up is
++closed. Test only with your own address, then unsubscribe with the link in the
++first email. Each sign-up records the consent version that `privacy.html#email`
++describes; change both together.
+ 
+ ## Local dev
+ 
+diff --git a/_worker.js b/_worker.js
+index d76a26c..ddfd847 100644
+--- a/_worker.js
++++ b/_worker.js
+@@ -43,6 +43,8 @@ async function boundedJSON(request, limit = 512) {
+ 
+ // The consent each list records. privacy.html describes both.
+ const lists = { news: 'news-2026-10-30', gateway: 'gateway-2026-10-30' };
++// The same lists by their names in Utskick.
++const utskickLists = { news: 'ftw-news', gateway: 'ftw-box' };
+ const countries = new Set(['SE', 'NO', 'DK', 'FI', 'DE', 'NL', 'EU', 'XX']);
+ const emailPattern = /^[^\s@<>()\[\],;:"]+@[^\s@<>()\[\],;:"]+\.[^\s@<>()\[\],;:"]{2,}$/;
+ 
+@@ -60,11 +62,11 @@ async function signup(request, env, url) {
+   if (country !== null && !countries.has(country)) return json({ error: 'invalid_country' }, 400);
+   // A filled hidden field means a form-filling bot. Answer as if it worked and store nothing.
+   if (body.website) return json({ ok: true });
+-  if (!env.SIGNUPS_DB) return json({ error: 'signup_unavailable' }, 503);
++  if (!env.UTSKICK) return json({ error: 'signup_unavailable' }, 503);
+   try {
+-    await env.SIGNUPS_DB.prepare(`INSERT INTO signups (email, list, country, consent) VALUES (?, ?, ?, ?)
+-      ON CONFLICT(email, list) DO UPDATE SET country = COALESCE(excluded.country, signups.country), consent = excluded.consent`)
+-      .bind(email, body.list, country, lists[body.list]).run();
++    // Utskick (srcfl/utskick) keeps the lists and sends the email. The call goes over a service
++    // binding and never leaves Cloudflare.
++    await env.UTSKICK.subscribe({ email, list: utskickLists[body.list], country, consent: lists[body.list], source: 'ftw-web' });
+   } catch (error) {
+     console.error(JSON.stringify({ event: 'signup_failed', name: error.name }));
+     return json({ error: 'signup_unavailable' }, 503);
+diff --git a/privacy.html b/privacy.html
+index cd4b89e..316b37c 100644
+--- a/privacy.html
++++ b/privacy.html
+@@ -44,7 +44,7 @@
+     <div class="wrap">
+       <p class="section-kicker">FTW apps, Cloud and the FTW plugin</p>
+       <h1>Privacy</h1>
+-      <p class="updated">Updated 30 October 2026</p>
++      <p class="updated">Updated 2 November 2026</p>
+ 
+       <p class="doc-lede">Your box keeps the energy record; your phone keeps a recent copy. The app reaches your box through FTW Cloud, which carries the connection encrypted end to end and cannot read it. A readable copy is off unless you turn it on. The app does not track you across apps or sites. The planned project statistics are described below.</p>
+ 
+@@ -113,7 +113,8 @@
+ 
+       <h2 id="email">FTW news and the FTW box waitlist</h2>
+       <p>On this website you can give us your email address for FTW news, for the FTW box waitlist, or both. We store the address, the list you joined, your country if you chose one, which consent you gave and when. We store nothing else from the form, and no IP address. We use the address only for that list: news about FTW, or an email when FTW boxes go on sale, with the price and shipping. We do not sell it or share it for advertising.</p>
+-      <p>The legal basis is your consent. You can leave a list at any time: every email we send will have a link for it, or email <a href="mailto:support@sourceful.energy">support@sourceful.energy</a>. We then delete your address from that list. We delete the waitlist when the box sale ends. The addresses are kept in a Cloudflare D1 database in the EU that Sourceful controls; Cloudflare processes them on our behalf. Before we send the first email, we will name the service that sends it here.</p>
++      <p>The legal basis is your consent. You can leave a list at any time with the link at the bottom of every email, or by emailing <a href="mailto:support@sourceful.energy">support@sourceful.energy</a>. We then delete your address from that list. So that we do not email you again by mistake, we keep a one-way hash of it: a fingerprint we can match a new sign-up against, but cannot turn back into the address. We delete the waitlist when the box sale ends.</p>
++      <p>The addresses are kept in a Cloudflare D1 database in the EU that Sourceful controls; Cloudflare processes them on our behalf. We send the emails with Utskick, our own open source newsletter sender, and they are delivered by Amazon Simple Email Service from Amazon Web Services' Frankfurt region in Germany; Amazon Web Services processes the address and the email on our behalf. When you click a link in one of our emails, the click passes through our own server first, which records which link it was and when, and nothing about your device or IP address. FTW emails have no tracking image, so we do not record whether you opened them. If an email cannot be delivered or is reported as spam, we stop sending to that address.</p>
+ 
+       <h2>Your rights</h2>
+       <p>Sourceful Labs AB (reg. no. 559382-0458), Kalmar, Sweden, is responsible for the data FTW Cloud and the relay handle. Under the GDPR you can ask what we hold about you, have it corrected or deleted, and object to how we use it. FTW Cloud holds no name, email address or street address for you, but your home id and IP addresses count as personal data. To ask, email <a href="mailto:support@sourceful.energy">support@sourceful.energy</a> or use <a href="https://www.sourceful.energy/contact">Sourceful's contact page</a>. You can also complain to the Swedish Authority for Privacy Protection (<a href="https://www.imy.se/en/">IMY</a>).</p>
+diff --git a/signups.sql b/signups.sql
+deleted file mode 100644
+index f049f02..0000000
+--- a/signups.sql
++++ /dev/null
+@@ -1,10 +0,0 @@
+--- News and FTW box waitlist sign-ups, bound to the Pages Worker as SIGNUPS_DB.
+--- Kept apart from the anonymous future votes: this table holds email addresses.
+-CREATE TABLE IF NOT EXISTS signups (
+-  email TEXT NOT NULL,
+-  list TEXT NOT NULL CHECK (list IN ('news', 'gateway')),
+-  country TEXT,
+-  consent TEXT NOT NULL,
+-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+-  PRIMARY KEY (email, list)
+-) WITHOUT ROWID;
+diff --git a/tests/signups.test.mjs b/tests/signups.test.mjs
+index 9ee7733..bb80e1c 100644
+--- a/tests/signups.test.mjs
++++ b/tests/signups.test.mjs
+@@ -1,24 +1,24 @@
+ import { test } from 'node:test';
+ import assert from 'node:assert/strict';
+-import { DatabaseSync } from 'node:sqlite';
+-import { readFileSync } from 'node:fs';
+ import worker from '../_worker.js';
+ 
+ function fixture({ bound = true } = {}) {
+-  const db = new DatabaseSync(':memory:');
+-  db.exec(readFileSync(new URL('../signups.sql', import.meta.url), 'utf8'));
+-  const binding = {
+-    prepare(sql) {
+-      return { bind(...params) { return { async run() { db.prepare(sql).run(...params); return { success: true }; } }; } };
++  // Stands in for Utskick's subscribe() on the UTSKICK service binding: one row per list, as Utskick keeps them.
++  const lists = new Map();
++  const utskick = {
++    async subscribe({ email, list, country, consent }) {
++      const key = `${email} ${list}`;
++      lists.set(key, { email, list, country: country ?? lists.get(key)?.country ?? null, consent });
++      return { ok: true };
+     }
+   };
+-  const env = { ASSETS: { fetch: () => new Response('static') }, ...(bound ? { SIGNUPS_DB: binding } : {}) };
++  const env = { ASSETS: { fetch: () => new Response('static') }, ...(bound ? { UTSKICK: utskick } : {}) };
+   const call = (body, { method = 'POST', origin = 'https://ftw.test', type = 'application/json' } = {}) => worker.fetch(new Request('https://ftw.test/api/signup', {
+     method,
+     headers: { Origin: origin, 'Content-Type': type },
+     ...(method === 'POST' ? { body: typeof body === 'string' ? body : JSON.stringify(body) } : {})
+   }), env);
+-  const rows = () => db.prepare('SELECT email, list, country, consent FROM signups ORDER BY list, email').all().map(r => ({ ...r }));
++  const rows = () => [...lists.values()].sort((a, b) => a.list.localeCompare(b.list) || a.email.localeCompare(b.email));
+   return { call, rows };
+ }
+ 
+@@ -28,7 +28,7 @@ test('a sign-up stores a normalized address on its list with the consent it was
+   assert.equal(response.status, 200);
+   assert.deepEqual(await response.json(), { ok: true });
+   assert.equal(response.headers.get('cache-control'), 'no-store');
+-  assert.deepEqual(rows(), [{ email: 'fredrik@example.com', list: 'gateway', country: 'SE', consent: 'gateway-2026-10-30' }]);
++  assert.deepEqual(rows(), [{ email: 'fredrik@example.com', list: 'ftw-box', country: 'SE', consent: 'gateway-2026-10-30' }]);
+ });
+ 
+ test('the same address can join both lists, and joining again neither duplicates nor reveals it', async () => {
+@@ -38,8 +38,8 @@ test('the same address can join both lists, and joining again neither duplicates
+   const again = await call({ email: 'A@example.com', list: 'gateway' });
+   assert.deepEqual(await again.json(), { ok: true });
+   assert.deepEqual(rows(), [
+-    { email: 'a@example.com', list: 'gateway', country: 'NO', consent: 'gateway-2026-10-30' },
+-    { email: 'a@example.com', list: 'news', country: null, consent: 'news-2026-10-30' }
++    { email: 'a@example.com', list: 'ftw-box', country: 'NO', consent: 'gateway-2026-10-30' },
++    { email: 'a@example.com', list: 'ftw-news', country: null, consent: 'news-2026-10-30' }
+   ]);
+ });
+ 
+@@ -77,7 +77,7 @@ test('a filled hidden field looks accepted but stores nothing', async () => {
+   assert.deepEqual(rows(), []);
+ });
+ 
+-test('without its database the endpoint says sign-up is unavailable and claims nothing', async () => {
++test('without the Utskick binding the endpoint says sign-up is unavailable and claims nothing', async () => {
+   const { call } = fixture({ bound: false });
+   const response = await call({ email: 'a@example.com', list: 'news' });
+   assert.equal(response.status, 503);
