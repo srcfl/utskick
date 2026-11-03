@@ -11,7 +11,10 @@ const mail = { from: 'a@news.test', to: 'b@example.com', subject: 'S', html: '<p
 test('SES errors are told apart by their type', async () => {
   const error = (status: number, headers: Record<string, string>, body: unknown) => SesError.from(new Response(JSON.stringify(body), { status, headers }));
   const cases: [SesError, string, string][] = [
-    [await error(400, { 'x-amzn-ErrorType': 'MessageRejected:http://internal.amazon.com/coral/com.amazonaws.sesv2/' }, { message: 'Email address is not verified: b@example.com' }), 'MessageRejected 400', 'recipient'],
+    [await error(400, { 'x-amzn-ErrorType': 'MessageRejected:http://internal.amazon.com/coral/com.amazonaws.sesv2/' }, { message: 'Content rejected for b@example.com' }), 'MessageRejected 400', 'recipient'],
+    // The sandbox, or a sender SES does not know: every other mail would be refused too.
+    [await error(400, { 'x-amzn-ErrorType': 'MessageRejected:http://internal.amazon.com/coral/com.amazonaws.sesv2/' }, { message: 'Email address is not verified. The following identities failed the check: b@example.com' }), 'MessageRejected 400 unverified', 'account'],
+    [await error(400, {}, { code: 'ThrottlingException', message: 'Daily message quota exceeded.' }), 'Throttling 400 quota', 'account'],
     [await error(400, {}, { __type: 'com.amazonaws.sesv2#BadRequestException', message: 'Illegal address' }), 'BadRequest 400', 'recipient'],
     [await error(429, {}, { message: 'Maximum sending rate exceeded.' }), 'HTTP 429', 'throttled'],
     [await error(400, {}, { code: 'ThrottlingException' }), 'Throttling 400', 'throttled'],

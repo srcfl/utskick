@@ -39,7 +39,7 @@ Answers:
 
 | Status | `error` | Why |
 |---|---|---|
-| 400 | `invalid_email`, `invalid_list`, `invalid_consent`, `invalid_first_name`, `invalid_country` | That field is wrong. `invalid_list` also covers a list the form may not use. |
+| 400 | `invalid_email`, `invalid_list`, `invalid_consent` | That field is wrong. `invalid_list` also covers a list the form may not use. A first name or country that is not one is dropped, not refused. |
 | 400 | `invalid_body`, `invalid_redirect` | Not a JSON object; a thank-you page that is not on the form's origins. |
 | 401 | `key_required`, `invalid_key` | No key, or not a form's key. A browser posting from the page of a form that needs a key gets `key_required`. |
 | 403 | `origin_not_allowed` | The `Origin` is on no form's list. `null` never is. |
@@ -139,22 +139,23 @@ curl https://news.example.com/subscribe \
   -d '{"email": "reader@example.com", "list": "newsletter", "consent": "newsletter-2026-11"}'
 ```
 
-Keep the route's own checks and its own limit per visitor. Utskick's rate limit sees the server's address, not the visitor's, so for a server it caps the server as a whole. [examples/sourceful-web.md](examples/sourceful-web.md) is a Next.js route that does this.
+Keep the route's own checks and its own limit per visitor. Utskick's rate limit sees the server's address, not the visitor's, so for a server it caps the server as a whole: 10 sign-ups a minute. Pass the visitor's address in `X-Client-IP` and the limit counts per visitor instead; the form's key vouches for the header, so Utskick reads it only from a form with a key.
 
 ## 3. A Cloudflare Worker or Pages project, over a service binding
 
 Bind the `utskick` Worker as a service (in a Pages project: Settings → Bindings → Service binding) and call the method:
 
 ```js
-await env.UTSKICK.subscribe({ email, list: 'newsletter', consent: 'newsletter-2026-11', source: 'my-site', country: 'SE', firstName: 'Robin' });
+await env.UTSKICK.subscribe({ email, list: 'newsletter', consent: 'newsletter-2026-11', source: 'my-site', country: 'SE', firstName: 'Robin',
+  ip: request.headers.get('CF-Connecting-IP') });
 ```
 
-The call never leaves Cloudflare, so there is no Origin, key or rate limit on Utskick's side: the calling site does those checks before it calls. It throws `invalid_list`, `invalid_email` or `invalid_consent` for a bad field and returns `{ ok: true }` otherwise. Bind it in production only, or a preview deployment signs people up for real. [examples/ftw-web.md](examples/ftw-web.md) is a Pages site that does this.
+The call never leaves Cloudflare, so there is no Origin or key on Utskick's side: the calling site checks those before it calls. The rate limit holds, though, since the site's own form is open to anyone: 10 sign-ups a minute per visitor when the site passes the visitor's address as `ip`, and 10 a minute for the whole site when it does not. It throws `rate_limited`, `invalid_list`, `invalid_email` or `invalid_consent`, and returns `{ ok: true }` otherwise. Bind it in production only, or a preview deployment signs people up for real. [examples/ftw-web.md](examples/ftw-web.md) is a Pages site that does this.
 
 ## Abuse limits
 
 - **Size.** At most 2 KB; Utskick stops reading past that.
-- **Rate.** 10 sign-ups a minute per form and client address (`CF-Connecting-IP`), with the Workers Rate Limiting binding `SIGNUP_LIMITER` in `cloudflare.config.ts`. That binding counts per Cloudflare location and is meant to be cheap rather than exact, so a few more can get through. Without the binding, as in the tests, a counter in memory takes its place. Requests refused for their origin, key, size, type, body or redirect do not count; everything after those checks does, valid or not.
+- **Rate.** 10 sign-ups a minute per form and client address (`CF-Connecting-IP`, or `X-Client-IP` from a form with a key; `ip` over a service binding), with the Workers Rate Limiting binding `SIGNUP_LIMITER` in `cloudflare.config.ts`. That binding counts per Cloudflare location and is meant to be cheap rather than exact, so a few more can get through. Without the binding, as in the tests, a counter in memory takes its place. Requests refused for their origin, key, size, type, body or redirect do not count; everything after those checks does, valid or not.
 - **Bots.** The hidden `website` field: a bot that fills it gets the usual answer and nothing is stored.
 - **Consent.** Only the list's current consent id is accepted.
 - **No redirect elsewhere.** `redirect` must be on the form's own origins, compared as parsed URLs, so `https://example.com.evil.example/` and `javascript:` are refused.

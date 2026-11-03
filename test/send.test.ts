@@ -124,7 +124,7 @@ test('FTW mail counts clicks but has no open pixel', async () => {
   ses = fakeSes();
   const env = testEnv();
   await handle(admin('/admin/import', { list: 'ftw-news', source: 'ftw-web', consent: 'news-2026-10-30', contacts: [{ email: 'a@example.com' }], suppressions: [] }), env);
-  await create(env, { key: 'ftw-news-1', list: 'ftw-news', kind: 'live', subject: 'FTW', html: '<html><body><a href="https://ftw.sourceful.energy">FTW</a></body></html>' });
+  await create(env, { key: 'ftw-news-1', list: 'ftw-news', kind: 'live', subject: 'FTW', html: '<html><body><a href="https://ftw.sourceful.energy">FTW</a><a href="*|UNSUB|*">u</a></body></html>' });
   await batch(env, 'ftw-news-1');
   const html = ses.outbox[0].Content.Simple.Body.Html.Data;
   assert.match(html, /href="https:\/\/news\.test\/c\/[0-9a-f]{32}\/0"/);
@@ -268,7 +268,7 @@ test('List-Id leaves out a list name that is not plain ASCII', async () => {
   const listId = (key: string) => ses.outbox.find(m => m.EmailTags?.[0].Value === key)!.Content.Simple.Headers.find(h => h.Name === 'List-Id')!.Value;
   for (const list of ['ftw-news', 'ftw-box']) {
     await handle(admin('/admin/import', { list, source: 's', consent: 'c', contacts: [{ email: 'a@example.com' }], suppressions: [] }), env);
-    await create(env, { key: list, list, kind: 'live', subject: 'S', html: '<p>x</p>' });
+    await create(env, { key: list, list, kind: 'live', subject: 'S', html: '<p>x</p><a href="*|UNSUB|*">u</a>' });
     await batch(env, list);
   }
   assert.equal(listId('ftw-news'), 'FTW news <ftw-news.news.test>');
@@ -280,10 +280,10 @@ test('a resend is refused for a list without the open pixel', async () => {
   ses = fakeSes();
   const env = testEnv();
   await handle(admin('/admin/import', { list: 'ftw-news', source: 's', consent: 'c', contacts: [{ email: 'a@example.com' }], suppressions: [] }), env);
-  await create(env, { key: 'ftw-news-1', list: 'ftw-news', kind: 'live', subject: 'FTW', html: '<p>x</p>' });
+  await create(env, { key: 'ftw-news-1', list: 'ftw-news', kind: 'live', subject: 'FTW', html: '<p>x</p><a href="*|UNSUB|*">u</a>' });
   await runBatch(env, 'ftw-news-1', 10, new Date('2026-11-01T10:00:00Z'));
   for (const dryRun of [true, false]) {
-    const { status, body } = await create(env, { key: 'ftw-news-1-resend', list: 'ftw-news', kind: 'resend', parent: 'ftw-news-1', subject: 'Again', html: '<p>x</p>', dryRun, now: '2026-11-08T10:00:00Z' });
+    const { status, body } = await create(env, { key: 'ftw-news-1-resend', list: 'ftw-news', kind: 'resend', parent: 'ftw-news-1', subject: 'Again', html: '<p>x</p><a href="*|UNSUB|*">u</a>', dryRun, now: '2026-11-08T10:00:00Z' });
     assert.equal(status, 400);
     assert.match(body.error, /^resend_needs_opens/);
   }

@@ -26,7 +26,7 @@ test('discovery: authorization server and protected resource metadata', async ()
   assert.deepEqual(as.grant_types_supported, ['authorization_code', 'refresh_token']);
   assert.equal(as.client_id_metadata_document_supported, true);
   assert.equal(as.authorization_response_iss_parameter_supported, true);
-  assert.deepEqual(as.scopes_supported, ['stats.read', 'subscribers.read', 'drafts.write', 'test.send']);
+  assert.deepEqual(as.scopes_supported, ['stats.read', 'subscribers.read', 'drafts.write', 'test.send', 'lists.write']);
 
   for (const path of ['/.well-known/oauth-protected-resource', '/.well-known/oauth-protected-resource/mcp']) {
     const res = await get(env, path);
@@ -75,7 +75,7 @@ test('dynamic registration takes https, loopback and the Cursor callback, and no
   assert.notEqual(row.secret_hash, confidential.body.client_secret, 'only the hash is kept');
 });
 
-test('authorize needs a signed-in admin before it looks at the request', async () => {
+test('authorize needs a signed-in member before it looks at the request', async () => {
   const env = testEnv();
   const client = (await register(env)).body.client_id;
   const { challenge } = pkce();
@@ -85,7 +85,7 @@ test('authorize needs a signed-in admin before it looks at the request', async (
   env.DEV_IDENTITY = 'stranger@example.com';
   const stranger = await authorize(env, params);
   assert.equal(stranger.status, 403);
-  assert.match(stranger.html, /not an admin/);
+  assert.match(stranger.html, /not a member/);
   env.DEV_IDENTITY = 'Admin@Example.com';
   assert.equal((await authorize(env, params)).status, 200);
 });

@@ -15,7 +15,7 @@ async function sentTo(emails: string[]) {
   const env = testEnv();
   const contacts = emails.map(email => ({ email, consentedAt: '2024-01-01T00:00:00Z' }));
   await handle(admin('/admin/import', { list: 'the-source', source: 'mailchimp-import', consent: 'mailchimp-the-source', contacts, suppressions: [] }), env);
-  await handle(admin('/admin/sends', { key: 'the-source-22', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p>' }), env);
+  await handle(admin('/admin/sends', { key: 'the-source-22', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p><a href="*|UNSUB|*">u</a>' }), env);
   await handle(admin('/admin/sends/the-source-22/batch', { max: 10 }), env);
   return env;
 }
@@ -40,24 +40,62 @@ test('a permanent bounce suppresses the address on every list', async () => {
   assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: '*', reason: 'bounce' }]);
   assert.deepEqual(await rows(env, `SELECT email FROM contacts ORDER BY email`), [{ email: 'ok@example.com' }]);
   assert.deepEqual(await rows(env, `SELECT e.type, d.message_id FROM events e JOIN deliveries d ON d.id = e.delivery_id`), [{ type: 'bounce', message_id: 'msg-2' }]);
-  const next = await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p>' }), env);
+  const next = await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p><a href="*|UNSUB|*">u</a>' }), env);
   assert.equal((await next.json() as Record<string, number>).recipients, 1);
 });
 
-test('a soft bounce on a second mail suppresses the address', async () => {
-  const env = await sentTo(['full@example.com']);
-  await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S2', html: '<p>y</p>' }), env);
-  await handle(admin('/admin/sends/the-source-23/batch', { max: 10 }), env);
-  const soft = (id: string) => post(sesEvent({
+test('a full mailbox on a second mail suppresses the address; a busy server does not', async () => {
+  const twoMails = async () => {
+    const env = await sentTo(['full@example.com']);
+    await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S2', html: '<p>y</p><a href="*|UNSUB|*">u</a>' }), env);
+    await handle(admin('/admin/sends/the-source-23/batch', { max: 10 }), env);
+    return env;
+  };
+  const soft = (id: string, bounceSubType: string) => post(sesEvent({
     eventType: 'Bounce',
     mail: { messageId: id },
-    bounce: { bounceType: 'Transient', bouncedRecipients: [{ emailAddress: 'full@example.com' }] },
+    bounce: { bounceType: 'Transient', bounceSubType, bouncedRecipients: [{ emailAddress: 'full@example.com' }] },
   }));
-  await handle(soft('msg-1'), env);
-  await handle(soft('msg-1'), env);
+  let env = await twoMails();
+  await handle(soft('msg-1', 'General'), env);
+  await handle(soft('msg-2', 'General'), env);
+  assert.deepEqual(await rows(env, 'SELECT * FROM suppressions'), [], 'a server that is slow to trust a new sender says nothing about the address');
+  ses.restore();
+  env = await twoMails();
+  await handle(soft('msg-1', 'MailboxFull'), env);
+  await handle(soft('msg-1', 'MailboxFull'), env);
   assert.deepEqual(await rows(env, 'SELECT * FROM suppressions'), [], 'two soft bounces of one mail are still one');
-  await handle(soft('msg-2'), env);
+  await handle(soft('msg-2', 'MailboxFull'), env);
   assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: '*', reason: 'bounce' }]);
+});
+
+test('a bounce report suppresses the mail\'s own recipient, not the addresses the report names', async () => {
+  const env = await sentTo(['ok@example.com', 'sly@example.com']);
+  const [sly] = await rows(env, `SELECT d.message_id FROM deliveries d JOIN contacts c ON c.id = d.contact_id WHERE c.email = 'sly@example.com'`);
+  await handle(post(sesEvent({
+    eventType: 'Bounce',
+    mail: { messageId: sly.message_id, destination: ['sly@example.com'] },
+    bounce: { bounceType: 'Permanent', bouncedRecipients: [{ emailAddress: 'ok@example.com' }, { emailAddress: 'victim@example.com' }] },
+  })), env);
+  assert.deepEqual(await rows(env, 'SELECT email FROM contacts'), [{ email: 'ok@example.com' }]);
+  assert.equal((await rows(env, 'SELECT COUNT(*) AS n FROM suppressions')).at(0)!.n, 1);
+  // A mail Utskick cannot place: only an address the mail itself went to counts.
+  await handle(post(sesEvent({
+    eventType: 'Complaint',
+    mail: { messageId: 'msg-unknown', destination: ['nobody@example.com'] },
+    complaint: { complainedRecipients: [{ emailAddress: 'ok@example.com' }] },
+  })), env);
+  assert.deepEqual(await rows(env, 'SELECT email FROM contacts'), [{ email: 'ok@example.com' }]);
+});
+
+test('an event for a row whose settle was lost marks it sent, and a message that is not JSON is ignored', async () => {
+  const env = await sentTo(['ok@example.com']);
+  await env.DB.prepare(`UPDATE deliveries SET status = 'unknown', message_id = NULL`).run();
+  await handle(post(sesEvent({ eventType: 'Delivery', mail: { messageId: 'msg-9', destination: ['ok@example.com'], tags: { send: ['the-source-22'] } } })), env);
+  assert.deepEqual(await rows(env, 'SELECT status, message_id FROM deliveries'), [{ status: 'sent', message_id: 'msg-9' }]);
+  assert.deepEqual(await rows(env, 'SELECT type FROM events'), [{ type: 'delivery' }]);
+  const res = await handle(post(snsMessage({ Type: 'Notification', Message: 'not json' })), env);
+  assert.equal(res.status, 200);
 });
 
 test('a transient bounce is logged but suppresses nothing', async () => {
@@ -158,4 +196,18 @@ test('the webhook refuses a huge body without reading it all, and a null body wi
   const big = new Request('https://news.test/hooks/ses', { method: 'POST', body: 'x'.repeat(300 * 1024) });
   assert.equal((await handle(big, env)).status, 413);
   assert.equal((await handle(post(null), env)).status, 400);
+});
+
+// review: a reader who reports spam and unsubscribes at once has no contact row left when the complaint comes.
+test('a complaint after the reader already unsubscribed still suppresses the address everywhere', async () => {
+  const env = await sentTo(['angry@example.com']);
+  const [d] = await rows(env, 'SELECT token, message_id FROM deliveries');
+  await handle(new Request(`https://news.test/u/${d.token}`, { method: 'POST' }), env);
+  assert.deepEqual(await rows(env, 'SELECT * FROM contacts'), []);
+  await handle(post(sesEvent({
+    eventType: 'Complaint',
+    mail: { messageId: d.message_id, destination: ['angry@example.com'] },
+    complaint: { complainedRecipients: [{ emailAddress: 'angry@example.com' }] },
+  })), env);
+  assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions ORDER BY scope'), [{ scope: '*', reason: 'complaint' }, { scope: 'the-source', reason: 'unsubscribe' }]);
 });

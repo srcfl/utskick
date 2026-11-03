@@ -115,8 +115,17 @@ set and the sender's domain in SES, then run \`resume ${key}\`.`);
   }
 }
 
+// What the dry run found wrong with the mail. Older Workers send no warnings. One line each, whatever the text holds.
+function printWarnings(r: any) {
+  if (!Array.isArray(r.warnings)) return;
+  for (const w of r.warnings) console.log(`warning: ${String(w).replace(/[\s\x00-\x1f\x7f]+/g, ' ').trim()}`);
+}
+
 function printDryRun(r: any) {
   console.log(`${r.recipients} recipients${r.excluded ? `, ${r.excluded} subscribers left out (unsubscribed, bounced or complained)` : ''}`);
+  // Older Workers do not send the size either.
+  if (Number.isFinite(r.bytes)) console.log(`size: ${(r.bytes / 1024).toFixed(1)} KB (the sample's HTML)`);
+  printWarnings(r);
   console.log(`subject: ${r.sample.subject}\nfrom: ${r.sample.from}\nreply-to: ${r.sample.replyTo}`);
   console.log(`tracked links (${r.links.length}):`);
   r.links.forEach((l: string, n: number) => console.log(`  ${n}  ${l}`));
@@ -156,6 +165,8 @@ async function send(kind: 'live' | 'resend') {
     printDryRun(dry);
     fail(`\nNothing sent. This goes to ${dry.recipients} people on ${list()}. To send, run again with --confirm ${dry.recipients}`);
   }
+  // The count matches, so this goes out. Show once more what the dry run warned about.
+  printWarnings(dry);
   const r = await api('POST', '/admin/sends', body);
   console.log(`created ${key}: ${r.recipients} recipients`);
   await deliver(key);

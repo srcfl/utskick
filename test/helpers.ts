@@ -160,6 +160,16 @@ export function snsMessage(fields: Record<string, string>, version: '1' | '2' = 
   return msg;
 }
 
+// A reader's browser. A click or an open from it counts as a person's (src/tracking.ts); a request
+// with no user agent counts as a machine's.
+export const browser = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15';
+export const reader = (url: string, method = 'GET') => new Request(url, { method, headers: { 'User-Agent': browser } });
+
+// Mail that went out an hour ago: a click now comes after the half minute in which only scanners click.
+export async function aged(env: { DB: ReturnType<typeof fakeD1> }) {
+  await env.DB.prepare(`UPDATE deliveries SET sent_at = ? WHERE sent_at IS NOT NULL`).bind(new Date(Date.now() - 3600_000).toISOString().slice(0, 19) + 'Z').run();
+}
+
 export async function rows<T = Record<string, Value>>(env: { DB: ReturnType<typeof fakeD1> }, sql: string, ...params: Value[]): Promise<T[]> {
   return (await env.DB.prepare(sql).bind(...params).all()).results as T[];
 }

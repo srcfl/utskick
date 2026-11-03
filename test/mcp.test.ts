@@ -5,7 +5,7 @@ import { cron, runApproved } from '../src/approvals.ts';
 import { escapeHtml } from '../src/render.ts';
 import { createSend } from '../src/send.ts';
 import { iso } from '../src/util.ts';
-import { admin, fakeSes, rows, testEnv } from './helpers.ts';
+import { admin, aged, fakeSes, reader, rows, testEnv } from './helpers.ts';
 import { base, callTool, connect, resource, rpc } from './oauth-helpers.ts';
 
 let ses: ReturnType<typeof fakeSes>;
@@ -37,7 +37,8 @@ test('initialize and tools/list, as the initialize-based revisions ask', async (
   assert.equal(note.status, 202);
   const list = await rpc(env, c.access, 'tools/list', {}, { 'MCP-Protocol-Version': '2025-06-18' });
   const tools = list.body.result.tools as Record<string, any>[];
-  assert.deepEqual(tools.map(t => t.name).sort(), ['approval_status', 'draft_preview', 'draft_save', 'drafts_list', 'request_send', 'send_stats', 'sends_list', 'subscriber_counts', 'test_send']);
+  assert.deepEqual(tools.map(t => t.name).sort(), ['approval_status', 'deliverability', 'draft_preview', 'draft_save', 'drafts_list', 'list_add', 'list_create', 'list_delete',
+    'list_growth', 'list_remove', 'request_send', 'send_stats', 'sends_list', 'subscriber_counts', 'test_send']);
   const stats = tools.find(t => t.name === 'send_stats')!;
   assert.deepEqual(stats.securitySchemes, [{ type: 'oauth2', scopes: ['stats.read'] }]);
   assert.equal(stats.annotations.readOnlyHint, true);
@@ -97,14 +98,16 @@ test('stats.read: aggregate stats and clicks per link, never an address', async 
   await seed(env, 3);
   await handle(admin('/admin/sends', { key: 'the-source-30', list: 'the-source', kind: 'live', subject: 'Issue 30', html: issueHtml }), env);
   await handle(admin('/admin/sends/the-source-30/batch', { max: 10 }), env);
+  await aged(env);
   const [d] = await rows(env, 'SELECT token FROM deliveries LIMIT 1');
-  await handle(new Request(`${base}/c/${d.token}/0`), env);
+  await handle(reader(`${base}/c/${d.token}/0`), env);
   const c = await connect(env, { scope: 'stats.read' });
   const list = await callTool(env, c.access, 'sends_list');
   assert.deepEqual(list.data.sends.map((s: any) => [s.key, s.recipients, s.sent]), [['the-source-30', 3, 3]]);
   const stats = await callTool(env, c.access, 'send_stats', { key: 'the-source-30' });
   assert.equal(stats.data.recipients, 3);
-  assert.deepEqual(stats.data.links[0], { n: 0, url: 'https://sourceful.energy/news', unique: 1, total: 1 });
+  assert.deepEqual(stats.data.links[0], { n: 0, url: 'https://sourceful.energy/news', unique: 1, total: 1, machine: 0, any: 1 });
+  assert.equal(stats.data.rates.click, 0.3333);
   const text = JSON.stringify(stats.result) + JSON.stringify(list.result);
   assert.doesNotMatch(text, /reader\d@example\.com/);
   assert.doesNotMatch(text, /@/);
@@ -168,19 +171,22 @@ test('test.send: only to addresses on the allowlist, marked as a test', async ()
   assert.equal(one.data.sent, 1);
   assert.deepEqual(ses.outbox.map(m => m.Destination.ToAddresses[0]), ['tester@example.com']);
   assert.equal(ses.outbox[0].Content.Simple.Subject.Data, '[Test] Issue 32');
-  const everyone = await callTool(env, c.access, 'test_send', { draft: id });
-  assert.equal(everyone.data.sent, 2, 'no list: the whole allowlist');
+  const self = await callTool(env, c.access, 'test_send', { draft: id });
+  assert.equal(self.data.sent, 1, 'no list: the person who connected the assistant');
+  assert.equal(ses.outbox.at(-1)!.Destination.ToAddresses[0], 'admin@example.com');
+  const both = await callTool(env, c.access, 'test_send', { draft: id, to: ['admin@example.com', 'second.tester@example.com'] });
+  assert.equal(both.data.sent, 2);
   const [send] = await rows(env, `SELECT kind FROM sends ORDER BY id DESC LIMIT 1`);
   assert.equal(send.kind, 'test');
 
   await handle(admin('/admin/sends', { key: 'the-source-29', list: 'the-source', kind: 'live', subject: 'Issue 29', html: issueHtml }), env);
   const issue = await callTool(env, c.access, 'test_send', { send: 'the-source-29', to: ['tester@example.com'] });
   assert.equal(issue.data.sent, 1);
-  assert.equal(ses.outbox.length, 4);
-  assert.ok(ses.outbox.every(m => ['tester@example.com', 'second.tester@example.com'].includes(m.Destination.ToAddresses[0])));
+  assert.equal(ses.outbox.length, 5);
+  assert.ok(ses.outbox.every(m => ['admin@example.com', 'tester@example.com', 'second.tester@example.com'].includes(m.Destination.ToAddresses[0])));
 
   const audit = await rows(env, `SELECT summary FROM audit_log WHERE tool = 'test_send'`);
-  assert.equal(audit.length, 4);
+  assert.equal(audit.length, 5);
   for (const a of audit) assert.doesNotMatch(String(a.summary), /@/);
 });
 
@@ -432,10 +438,10 @@ test('the approval page shows the text part, every link target, what is hidden, 
   // Opening the page loads nothing from elsewhere: the preview inherits this policy.
   const csp = res.headers.get('Content-Security-Policy')!;
   assert.match(csp, /default-src 'none'/);
-  assert.match(csp, /img-src 'self' data:(;|$)/);
+  assert.match(csp, /img-src https:\/\/news\.test\/img\/ data:(;|$)/);
   assert.match(csp, /frame-ancestors 'none'/);
   assert.match(csp, /form-action 'self'/);
-  assert.doesNotMatch(csp, /https?:|\*/);
+  assert.doesNotMatch(csp.replace('https://news.test/img/', ''), /https?:|\*/, 'nothing from elsewhere');
   assert.equal(res.headers.get('Referrer-Policy'), 'no-referrer');
   assert.equal(res.headers.get('X-Frame-Options'), 'DENY');
   const srcdoc = page.match(/srcdoc="([^"]*)"/)![1];

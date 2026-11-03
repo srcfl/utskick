@@ -1,20 +1,28 @@
 // Sending to a list is never a right an assistant holds. It asks (request_send), and an admin
 // signs in, sees the list, the subject, the count and the mail itself, and approves or declines,
-// once, within ten minutes. Approval creates the send; the cron trigger sends it, 14 mails a second.
+// once, within the hours the config allows (24 by default). With approval.notifyFrom set, each admin
+// gets the link by mail and the assistant never holds it. Approval creates the send; the cron
+// trigger sends it, 14 mails a second.
 // The CLI's own sends (cli/utskick.ts) do not pass through here and the cron never touches them.
 import { audit } from './audit.ts';
 import type { Env } from './env.ts';
 import { getDraft, hex, inspectMail } from './drafts.ts';
 import { signedInAdmin } from './identity.ts';
+import { withLists } from './lists.ts';
 import { issuer, messagePage, sameOrigin, sweepOAuth, type Grant } from './oauth.ts';
 import { page } from './pages.ts';
-import { escapeHtml, render, stripComments, toText, trackedLinks } from './render.ts';
+import { escapeHtml, hasUnsubscribeLink, mailWarnings, render, stripComments, toText, trackedLinks } from './render.ts';
 import { createSend, runBatch } from './send.ts';
+import { sendEmail } from './ses.ts';
+import { boundedText } from './signup.ts';
 import { HttpError, iso, normalizeEmail, sha256 } from './util.ts';
 import { randomToken } from './clients.ts';
 
-const approvalTtl = 10 * 60_000;
 const testsPerHour = 20;
+const requestsPerHour = 10;
+// How long an admin has to answer: an hour to a week, 24 hours unless the config says otherwise.
+const approvalHours = (env: Env) => Math.max(1, Math.min(168, Number(env.CONFIG.approval?.hours) || 24));
+const hoursText = (env: Env) => { const h = approvalHours(env); return h === 1 ? 'an hour' : `${h} hours`; };
 
 interface ApprovalRow {
   id: string;
@@ -41,8 +49,9 @@ const keyPattern = /^[a-z0-9][a-z0-9-]{1,79}$/;
 
 export async function requestSend(env: Env, grant: Grant, a: Record<string, unknown>, now = new Date()) {
   const d = await getDraft(env, a.draft);
-  // A list mail without a way off the list is not one we send.
-  if (!d.html.includes('*|UNSUB|*')) throw new HttpError(400, 'The draft has no *|UNSUB|* link. A send to a list needs one: add it and save the draft again.');
+  // A list mail without a way off the list is not one we send: a link to it, not the tag in a comment.
+  if (!hasUnsubscribeLink(d.html)) throw new HttpError(400, 'The draft has no link to *|UNSUB|*. A send to a list needs one, e.g. <a href="*|UNSUB|*">Unsubscribe</a>: add it and save the draft again.');
+  if (env.CONFIG.lists[d.list]?.adhoc?.deleted) throw new HttpError(410, `The list ${d.list} was deleted.`);
   const key = a.key === undefined ? `${d.list}-${iso(now).slice(0, 10)}` : a.key;
   if (typeof key !== 'string' || !keyPattern.test(key)) throw new HttpError(400, 'key must be lowercase letters, digits and hyphens, 2 to 80 of them, e.g. the-source-23. It becomes the web version\'s address.');
   const taken = await env.DB.prepare(`SELECT 1 FROM sends WHERE key = ?1 UNION ALL SELECT 1 FROM approvals WHERE send_key = ?1
@@ -52,19 +61,63 @@ export async function requestSend(env: Env, grant: Grant, a: Record<string, unkn
   const dry = await createSend(env, { key, list: d.list, kind: 'live', subject: d.subject, html: d.html, dryRun: true }, now) as { recipients: number; excluded: number };
   const token = randomToken(32);
   const id = `a-${hex(6)}`;
-  const expires = iso(new Date(now.getTime() + approvalTtl));
-  await env.DB.prepare(`INSERT INTO approvals (id, token_hash, draft_id, send_key, list, subject, html, recipients, client_id, requested_by, grant_id,
-      draft_created_by, draft_changed_by, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+  const expires = iso(new Date(now.getTime() + approvalHours(env) * 3600_000));
+  // Each request mails every admin, so one person's assistant in a loop must not fill their inboxes.
+  // The count and the insert are one statement, so requests that come at once cannot all pass.
+  const stored = await env.DB.prepare(`INSERT INTO approvals (id, token_hash, draft_id, send_key, list, subject, html, recipients, client_id, requested_by, grant_id,
+      draft_created_by, draft_changed_by, created_at, expires_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15
+      WHERE (SELECT COUNT(*) FROM approvals WHERE requested_by = ?10 AND created_at > ?16) < ?17`)
     .bind(id, await sha256(token), d.id, key, d.list, d.subject, d.html, dry.recipients, grant.clientId, grant.subject, grant.id,
-      d.created_by, d.client_id, iso(now), expires).run();
-  return {
-    approval: id,
-    approveUrl: `${issuer(env)}/approve/${token}`,
-    expiresAt: expires,
+      d.created_by, d.client_id, iso(now), expires, iso(new Date(now.getTime() - 3600_000)), requestsPerHour).run();
+  if (!stored.meta.changes) throw new HttpError(429, `At most ${requestsPerHour} send requests an hour for each person. Try again later.`);
+  const approveUrl = `${issuer(env)}/approve/${token}`;
+  const answer = {
+    approval: id, expiresAt: expires,
     key, list: d.list, listName: env.CONFIG.lists[d.list].name, subject: d.subject,
     recipients: dry.recipients, excluded: dry.excluded,
-    note: 'Nothing is sent yet. Give this link to the person who asked: an admin must open it, sign in and approve within ten minutes. It works once. The mail goes out as it is now, even if the draft changes later.',
   };
+  const mailed = await notifyAdmins(env, grant, { id, key, list: d.list, subject: d.subject, recipients: dry.recipients, expires }, approveUrl);
+  if (mailed) return {
+    ...answer, mailedAdmins: mailed,
+    note: `Nothing is sent yet. ${mailed === 1 ? 'The admin got' : `${mailed} admins got`} a mail with a link to see the mail and approve or decline it, until ${expires} (UTC). approval_status shows the answer. The mail goes out as it is now, even if the draft changes later.`,
+  };
+  return {
+    ...answer, approveUrl,
+    note: `Nothing is sent yet. Give this link to the person who asked: an admin must open it, sign in and approve within ${hoursText(env)}. It works once. The mail goes out as it is now, even if the draft changes later.`,
+  };
+}
+
+// Mails each admin the approval link, from approval.notifyFrom. The link alone approves nothing:
+// it opens a page behind the admin's own sign-in. Returns how many mails went out; 0 when the
+// config names no sender or SES took none, and the assistant then gets the link instead.
+async function notifyAdmins(env: Env, grant: Grant, r: { id: string; key: string; list: string; subject: string; recipients: number; expires: string }, url: string): Promise<number> {
+  const from = env.CONFIG.approval?.notifyFrom;
+  const admins = [...new Set((env.CONFIG.admins ?? []).map(normalizeEmail).filter((e): e is string => !!e))];
+  if (!from || !admins.length) return 0;
+  const list = env.CONFIG.lists[r.list];
+  const lines = [
+    `${grant.subject} asked, through ${grant.clientName}, to send “${r.subject}” to ${list.name} (${r.list}): ${r.recipients} recipients.`,
+    list.adhoc ? `The list was made through an assistant, for this: ${list.adhoc.purpose}` : '',
+    `Open the link to see the mail as it goes out, then send or decline it. It works once, until ${r.expires} (UTC), after you sign in.`,
+  ].filter(Boolean);
+  const html = `<!DOCTYPE html><html><body style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;font-size:15px;line-height:1.5;color:#0A0A0A">`
+    + lines.map(l => `<p>${escapeHtml(l)}</p>`).join('')
+    + `<p><a href="${escapeHtml(url)}" style="color:#E85D1F">Review the send</a></p>`
+    + `<p style="color:#6B7280;font-size:13px">Request ${escapeHtml(r.id)}, key ${escapeHtml(r.key)}. Utskick sent this because you are an admin of ${escapeHtml(env.CONFIG.organization)}'s newsletters.</p></body></html>`;
+  let sent = 0;
+  for (const to of admins) {
+    try {
+      await sendEmail(env, {
+        from, to, subject: `Approve a send: ${r.subject}`.slice(0, 200), html,
+        text: `${lines.join('\n\n')}\n\n${url}\n\nRequest ${r.id}, key ${r.key}.`,
+        headers: {}, tags: { kind: 'approval' },
+      });
+      sent++;
+    } catch (error) {
+      console.error(JSON.stringify({ event: 'notify_failed', approval: r.id, error: error instanceof Error ? error.message : 'unknown' }));
+    }
+  }
+  return sent;
 }
 
 export async function approvalStatus(env: Env, a: Record<string, unknown>, now = new Date()) {
@@ -88,11 +141,14 @@ export async function approvalStatus(env: Env, a: Record<string, unknown>, now =
 // tell that someone nothing: nothing loads from elsewhere, and the preview, a sandboxed srcdoc
 // frame, inherits this policy. Images from Utskick's own /img/ and data: URIs show; the rest is
 // listed as text. The page may not be framed, and its link, which holds the secret, is no referrer.
-const approvalPolicy = "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+// Utskick's own images are named by host and path: 'self' would not match inside the sandboxed
+// frame, whose origin is opaque.
+const images = (env: Env) => `${new URL(env.PUBLIC_URL).origin}/img/ data:`;
+const approvalPolicy = (env: Env) => `default-src 'none'; img-src ${images(env)}; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`;
 
-function guarded(res: Response): Response {
+function guarded(env: Env, res: Response): Response {
   res.headers.set('X-Frame-Options', 'DENY');
-  res.headers.set('Content-Security-Policy', approvalPolicy);
+  res.headers.set('Content-Security-Policy', approvalPolicy(env));
   res.headers.set('Referrer-Policy', 'no-referrer');
   res.headers.set('X-DNS-Prefetch-Control', 'off');
   return res;
@@ -100,42 +156,43 @@ function guarded(res: Response): Response {
 
 export async function approvalRoute(request: Request, env: Env, token: string): Promise<Response> {
   const who = await signedInAdmin(request, env);
-  if (!who.ok) return guarded(messagePage(env, who.status, 'Sign-in needed', who.reason));
+  if (!who.ok) return guarded(env, messagePage(env, who.status, 'Sign-in needed', who.reason));
   const a = await env.DB.prepare('SELECT * FROM approvals WHERE token_hash = ?').bind(await sha256(token)).first<ApprovalRow>();
-  if (!a) return guarded(messagePage(env, 404, 'No such request', 'This link leads to no send request. It may be cut short.'));
+  if (!a) return guarded(env, messagePage(env, 404, 'No such request', 'This link leads to no send request. It may be cut short.'));
   const now = new Date();
-  const closed = () => guarded(messagePage(env, a.status === 'pending' ? 410 : 409, 'This request is closed',
-    a.status === 'pending' ? 'It ran out ten minutes after the assistant asked. Ask it to request the send again.' : `It was ${a.status === 'declined' ? 'declined' : 'approved'} already.`));
+  const ranOut = `It ran out ${hoursText(env)} after the assistant asked. Ask it to request the send again.`;
+  const closed = () => guarded(env, messagePage(env, a.status === 'pending' ? 410 : 409, 'This request is closed',
+    a.status === 'pending' ? ranOut : `It was ${a.status === 'declined' ? 'declined' : 'approved'} already.`));
   if (request.method === 'GET') {
     if (a.status !== 'pending' || a.expires_at <= iso(now)) return closed();
-    return guarded(await approvalPage(env, a, who.email, token));
+    return guarded(env, await approvalPage(env, a, who.email, token));
   }
   if (request.method !== 'POST') return new Response('GET or POST', { status: 405, headers: { Allow: 'GET, POST' } });
-  if (!sameOrigin(request, env)) return guarded(messagePage(env, 403, 'This form came from elsewhere', 'Open the approval link again.'));
-  const decision = new URLSearchParams((await request.text()).slice(0, 1024)).get('decision');
-  if (decision !== 'approve' && decision !== 'decline') return guarded(messagePage(env, 400, 'No decision', 'Choose Send or Decline.'));
+  if (!sameOrigin(request, env)) return guarded(env, messagePage(env, 403, 'This form came from elsewhere', 'Open the approval link again.'));
+  const decision = new URLSearchParams(await boundedText(request, 1024).catch(() => '')).get('decision');
+  if (decision !== 'approve' && decision !== 'decline') return guarded(env, messagePage(env, 400, 'No decision', 'Choose Send or Decline.'));
 
-  // Single use: only a pending request inside its ten minutes changes, and only once.
+  // Single use: only a pending request inside its time changes, and only once.
   const taken = await env.DB.prepare(`UPDATE approvals SET status = ?, decided_by = ?, decided_at = ? WHERE id = ? AND status = 'pending' AND expires_at > ? RETURNING id`)
     .bind(decision === 'approve' ? 'approved' : 'declined', who.email, iso(now), a.id, iso(now)).first();
   if (!taken) {
     const fresh = await env.DB.prepare('SELECT status FROM approvals WHERE id = ?').bind(a.id).first<ApprovalRow>();
-    return guarded(messagePage(env, 409, 'This request is closed', fresh?.status === 'pending' ? 'It ran out ten minutes after the assistant asked. Ask it to request the send again.' : `It was ${fresh?.status} already.`));
+    return guarded(env, messagePage(env, 409, 'This request is closed', fresh?.status === 'pending' ? ranOut : `It was ${fresh?.status} already.`));
   }
   const entry = { clientId: a.client_id, subject: a.requested_by, scope: 'drafts.write', tool: 'request_send', summary: { approval: a.id, key: a.send_key, list: a.list, recipients: a.recipients }, approvedBy: who.email };
   if (decision === 'decline') {
     await audit(env, { ...entry, outcome: 'declined' });
-    return guarded(messagePage(env, 200, 'Declined', 'Nothing was sent. The assistant sees the request as declined.'));
+    return guarded(env, messagePage(env, 200, 'Declined', 'Nothing was sent. The assistant sees the request as declined.'));
   }
   try {
     const created = await createSend(env, { key: a.send_key, list: a.list, kind: 'live', subject: a.subject, html: a.html }, now);
     await audit(env, { ...entry, summary: { ...entry.summary, recipients: created.recipients }, outcome: 'approved' });
-    return guarded(messagePage(env, 200, 'Approved', `${created.recipients} mails go out from the next minute, 14 a second. Follow it with: node cli/utskick.ts stats ${a.send_key}`));
+    return guarded(env, messagePage(env, 200, 'Approved', `${created.recipients} mails go out from the next minute, 14 a second. Follow it with: node cli/utskick.ts stats ${a.send_key}`));
   } catch (error) {
     const message = error instanceof HttpError ? error.message : 'internal';
     await env.DB.prepare(`UPDATE approvals SET status = 'failed', error = ? WHERE id = ?`).bind(message, a.id).run();
     await audit(env, { ...entry, outcome: 'approved', summary: { ...entry.summary, error: message } });
-    return guarded(messagePage(env, 500, 'The send could not be created', `Nothing was sent (${message}).`));
+    return guarded(env, messagePage(env, 500, 'The send could not be created', `Nothing was sent (${message}).`));
   }
 }
 
@@ -154,6 +211,7 @@ async function approvalPage(env: Env, a: ApprovalRow, email: string, token: stri
   const mail = render(sent, urls);
   const text = toText(mail);
   const found = inspectMail(a.html);
+  const fixes = mailWarnings(a.html, mail);
   const names = await clientNames(env, [a.client_id, a.draft_created_by, a.draft_changed_by]);
   const who = (id: string | null) => id ? escapeHtml(names.get(id) ? `${names.get(id)} (${clip(id, 80)})` : clip(id, 80)) : 'an assistant Utskick did not record';
   const changedByOther = a.draft_changed_by !== null && a.draft_changed_by !== a.client_id;
@@ -174,19 +232,28 @@ async function approvalPage(env: Env, a: ApprovalRow, email: string, token: stri
       `<p>These do not show in the preview or in most inboxes, but they go out, and their words are in the text part.</p>${found.hidden.map(h => quote(`(${h.why}) ${h.text}`)).join('')}`) : '',
     found.styleSheetHides ? warn('style-hides', 'The style sheet hides something',
       '<p>A rule in the mail’s style sheet hides elements, often a mobile or desktop version. The text part below has every word the mail carries.</p>') : '',
+    fixes.length ? warn('mail-warnings', 'Check before sending', fixes.map(quote).join('')) : '',
   ].join('');
   const notes = [
     found.preheader !== null ? `<p class="small" style="margin-top:0">Preheader, shown beside the subject in some inboxes: ${escapeHtml(clip(found.preheader, 200))}</p>` : '',
     found.outlookBlocks && !found.outlook.length ? `<p class="small" style="margin-top:0">${found.outlookBlocks} Outlook-only layout blocks, with no text or links.</p>` : '',
   ].join('');
-  // The preview loads nothing from elsewhere; with links, meta tags and a base gone, not even a DNS lookup.
-  const preview = mail.replace(/<(?:link|meta|base)\b(?:[^>"']|"[^"]*"|'[^']*')*>/gi, '');
+  // The preview loads nothing from elsewhere; with links, meta tags and a base gone, not even a DNS
+  // lookup. The strip runs until nothing changes, so a tag split around another (<<meta>meta …>)
+  // cannot come back whole, and the frame carries the page's policy itself as well.
+  let preview = mail;
+  for (let before = ''; before !== preview;) {
+    before = preview;
+    preview = preview.replace(/<(?:link|meta|base)\b[^>]*>/gi, '');
+  }
+  preview = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ${images(env)}; style-src 'unsafe-inline'">${preview}`;
 
   return page(env.CONFIG, `Send ${a.subject}`, `<h1>Send this to ${escapeHtml(list?.name ?? a.list)}?</h1>
 <table>
 ${row('List', `${escapeHtml(list?.name ?? a.list)} (${escapeHtml(a.list)})`)}
 ${row('Subject', escapeHtml(a.subject))}
 ${row('From', escapeHtml(list?.from ?? ''))}
+${list?.adhoc ? row('Replies to', escapeHtml(list.replyTo ?? ''), 'adhoc-reply') + row('List made for', `${escapeHtml(list.adhoc.purpose)}<br><span class="small">A colleague made this list through an assistant and named its people. Ask yourself whether they expect this mail.</span>`, 'adhoc-purpose') : ''}
 ${row('Recipients', `<strong>${now}</strong> now, ${a.recipients} when the assistant asked`)}
 ${row('Key', escapeHtml(a.send_key))}
 ${row('Asked by', `${who(a.client_id)}, connected by ${escapeHtml(a.requested_by)}`)}
@@ -227,6 +294,7 @@ async function clientNames(env: Env, ids: (string | null)[]): Promise<Map<string
 
 interface RunOptions {
   budgetMs?: number;                    // stop starting batches after this long; the cron runs every minute
+  maxBatches?: number;                  // and after this many, to stay inside a run's limits on D1 queries
   perSecond?: number;                   // SES allows Sourceful 14 a second
   clock?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -239,7 +307,8 @@ export async function runApproved(env: Env, o: RunOptions = {}) {
   const sleep = o.sleep ?? ((ms: number) => new Promise<void>(r => setTimeout(r, ms)));
   const start = clock();
   let sent = 0;
-  while (clock() - start + 1000 <= budget) {
+  // Each batch settles its rows one by one (send.ts), about 20 queries in all; D1 allows a run 1,000.
+  for (let batches = 0; batches < (o.maxBatches ?? 30) && clock() - start + 1000 <= budget; batches++) {
     // The approval page marks a request approved and then creates its send. A request approved in
     // the last two minutes whose send is not there yet is left for the next run, not failed.
     const next = await env.DB.prepare(`SELECT a.id, a.send_key FROM approvals a WHERE a.status = 'approved'
@@ -276,24 +345,27 @@ export async function runApproved(env: Env, o: RunOptions = {}) {
 }
 
 export async function cron(env: Env) {
-  const result = await runApproved(env);
+  // A send to a list a colleague made needs that list's sender and name.
+  const result = await runApproved(await withLists(env));
   await sweepOAuth(env, new Date());
   if (result.sent) console.log(JSON.stringify({ event: 'cron', sent: result.sent }));
   return result;
 }
 
 // --------------------------------------------------------------------------
-// test_send: a draft or an issue, as a test, to the allowlist only
+// test_send: a draft or an issue, as a test, to the person asking or the allowlist only
 // --------------------------------------------------------------------------
 
-export async function testSend(env: Env, clientId: string, a: Record<string, unknown>) {
-  const allow = (env.CONFIG.testAllowlist ?? []).map(normalizeEmail).filter((e): e is string => !!e);
-  if (!allow.length) throw new HttpError(400, 'No test addresses are set up: testAllowlist in the config is empty.');
-  let to = allow;
+export async function testSend(env: Env, grant: Grant, a: Record<string, unknown>) {
+  // The signed-in person's own address, and the shared test addresses in the config.
+  const self = normalizeEmail(grant.subject);
+  const allow = [...new Set([self, ...(env.CONFIG.testAllowlist ?? []).map(normalizeEmail)].filter((e): e is string => !!e))];
+  let to = self ? [self] : allow;
+  if (!to.length) throw new HttpError(400, 'No test addresses are set up: testAllowlist in the config is empty.');
   if (a.to !== undefined) {
-    if (!Array.isArray(a.to) || !a.to.length || a.to.length > 20) throw new HttpError(400, 'to must list 1 to 20 addresses, or be left out for the whole test allowlist.');
+    if (!Array.isArray(a.to) || !a.to.length || a.to.length > 20) throw new HttpError(400, 'to must list 1 to 20 addresses, or be left out to send to yourself.');
     const asked = a.to.map(normalizeEmail);
-    if (asked.some(e => !e || !allow.includes(e))) throw new HttpError(403, 'Test mail goes only to the addresses on the test allowlist in the config. Leave "to" out to send to all of them.');
+    if (asked.some(e => !e || !allow.includes(e))) throw new HttpError(403, 'Test mail goes only to you and to the addresses on the test allowlist in the config. Leave "to" out to send to yourself.');
     to = [...new Set(asked as string[])];
   }
   if ((a.draft === undefined) === (a.send === undefined)) throw new HttpError(400, 'Give draft or send, one of them.');
@@ -312,7 +384,7 @@ export async function testSend(env: Env, clientId: string, a: Record<string, unk
   const now = new Date();
   const slot = await env.DB.prepare(`INSERT INTO test_send_slots (client_id, at) SELECT ?1, ?2
       WHERE (SELECT COUNT(*) FROM test_send_slots WHERE at > ?3) < ?4`)
-    .bind(clientId, iso(now), iso(new Date(now.getTime() - 3600_000)), testsPerHour).run();
+    .bind(grant.clientId, iso(now), iso(new Date(now.getTime() - 3600_000)), testsPerHour).run();
   if (!slot.meta.changes) throw new HttpError(429, `At most ${testsPerHour} test sends an hour. Try again later.`);
   const key = `${source.name.slice(0, 60)}-test-${hex(4)}`;
   const created = await createSend(env, { key, list: source.list, kind: 'test', subject: source.subject, html: source.html, testTo: to.map(email => ({ email })) });

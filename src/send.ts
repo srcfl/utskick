@@ -2,7 +2,7 @@
 import { isList } from './config.ts';
 import { firstName } from './contacts.ts';
 import type { Env } from './env.ts';
-import { render, stripComments, toText, trackedLinks } from './render.ts';
+import { hasUnsubscribeLink, mailWarnings, render, stripComments, toText, trackedLinks } from './render.ts';
 import { sendEmail, SesError, type Mail } from './ses.ts';
 import { HttpError, iso, normalizeEmail, sha256 } from './util.ts';
 
@@ -44,11 +44,13 @@ const stuckAfterMs = 10 * 60 * 1000;
 const notSuppressed = `NOT EXISTS (SELECT 1 FROM suppressions x WHERE x.email_hash = c.email_hash AND x.scope IN (?2, '*'))`;
 const audiences: Record<Kind, string> = {
   live: `SELECT c.id FROM subscriptions s JOIN contacts c ON c.id = s.contact_id WHERE s.list = ?2 AND ${notSuppressed}`,
-  // Those who got the parent and did nothing with it: no open, click, bounce, complaint or unsubscribe.
+  // Those who got the parent and did nothing with it: no open, click, bounce, complaint or unsubscribe,
+  // machine or not. Nor anyone an earlier resend of the same parent reached: one resend each, at most.
   resend: `SELECT c.id FROM deliveries d JOIN contacts c ON c.id = d.contact_id
     JOIN subscriptions s ON s.contact_id = c.id AND s.list = ?2
     WHERE d.send_id = ?3 AND d.status = 'sent' AND ${notSuppressed}
-      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_id = d.id AND e.type IN ('open', 'click', 'bounce', 'soft-bounce', 'complaint', 'unsubscribe'))`,
+      AND NOT EXISTS (SELECT 1 FROM events e WHERE e.delivery_id = d.id AND e.type IN ('open', 'click', 'bounce', 'soft-bounce', 'complaint', 'unsubscribe'))
+      AND NOT EXISTS (SELECT 1 FROM deliveries r JOIN sends rs ON rs.id = r.send_id WHERE rs.parent_id = ?3 AND rs.kind = 'resend' AND r.contact_id = c.id)`,
   // A test goes out even if the address left the list, but never to a bounce or a complaint.
   test: `SELECT c.id FROM contacts c WHERE c.email IN (SELECT value FROM json_each(?3))
     AND NOT EXISTS (SELECT 1 FROM suppressions x WHERE x.email_hash = c.email_hash AND x.scope = '*')`,
@@ -58,8 +60,12 @@ export async function createSend(env: Env, body: CreateBody, now = new Date()) {
   const { key, list, kind, subject } = body;
   if (typeof key !== 'string' || !/^[a-z0-9][a-z0-9-]{1,79}$/.test(key)) throw new HttpError(400, 'invalid_key');
   if (!isList(env.CONFIG, list)) throw new HttpError(400, 'invalid_list');
+  if (env.CONFIG.lists[list].adhoc?.deleted) throw new HttpError(400, 'list_deleted');
   if (!Object.hasOwn(audiences, kind)) throw new HttpError(400, 'invalid_kind');
   if (typeof body.html !== 'string' || !body.html.trim()) throw new HttpError(400, 'invalid_html');
+  // Every mail to a list carries a link off it, in the body as well as the List-Unsubscribe header.
+  // A test may go without, so a draft can be tried before its footer is done.
+  if (kind !== 'test' && !hasUnsubscribeLink(body.html)) throw new HttpError(400, 'no_unsubscribe_link: the HTML needs a link to *|UNSUB|*');
   // A line break in a subject would start a new header.
   if (typeof subject !== 'string' || !subject.trim() || subject.length > 200 || /\p{Cc}/u.test(subject)) throw new HttpError(400, 'invalid_subject');
   // A resend goes to those who did not open. Without the pixel that is everyone, and they would get it twice.
@@ -103,6 +109,8 @@ export async function createSend(env: Env, body: CreateBody, now = new Date()) {
   const params = kind === 'live' ? [key, list] : [key, list, third];
   const meta = env.CONFIG.lists[list];
   const fallback = body.fnameFallback ?? meta.fname ?? 'there';
+  // A list a colleague made takes its sender from the config's adhoc section, which may be gone.
+  if (!(body.from ?? meta.from)) throw new HttpError(400, 'no_sender: the config names no sender for this list');
 
   if (body.dryRun) {
     const recipients = await env.DB.prepare(`SELECT COUNT(*) AS n FROM (${audience})`).bind(...params).first<number>('n');
@@ -113,7 +121,8 @@ export async function createSend(env: Env, body: CreateBody, now = new Date()) {
     const sample = { email: first?.email ?? testTo[0]?.email ?? 'someone@example.com', first_name: first?.first_name ?? null };
     const draft: SendRow = { id: 0, key, list, kind, subject, from_addr: body.from ?? meta.from, reply_to: body.replyTo ?? meta.replyTo ?? null, html, links: JSON.stringify(links), fname_fallback: fallback, test_name: testName };
     const token = [...crypto.getRandomValues(new Uint8Array(16))].map(b => b.toString(16).padStart(2, '0')).join('');
-    return { key, dryRun: true, recipients, excluded, links, sample: mailFor(env, draft, { ...sample, token }) };
+    const mail = mailFor(env, draft, { ...sample, token });
+    return { key, dryRun: true, recipients, excluded, links, bytes: new TextEncoder().encode(mail.html).length, warnings: mailWarnings(html, mail.html), sample: mail };
   }
 
   // A test address needs a contact row for its delivery. A known one stays as it is, and a bounced or
@@ -182,46 +191,77 @@ export async function runBatch(env: Env, key: string, max: number, now = new Dat
     .bind(iso(now), send.id, limit).all<{ id: number }>()).results.map(r => r.id);
 
   const result = { sent: 0, skipped: 0, failed: 0, retry: 0, pending: 0, unknown: 0, sending: 0 };
-  let stop = null as SesError | null;  // set in the callbacks below
+  let stop = null as string | null;  // why the send stops; set in the callbacks below
   if (claimed.length) {
-    const recipients = (await env.DB.prepare(`SELECT d.id, d.token, c.email, c.first_name,
+    const recipients = (await env.DB.prepare(`SELECT d.id, d.token, d.error, c.email, c.first_name,
         CASE WHEN c.id IS NULL THEN 0
           WHEN EXISTS (SELECT 1 FROM suppressions x WHERE x.email_hash = c.email_hash AND (x.scope = '*' OR (x.scope = ?1 AND ?2 != 'test'))) THEN 0
           WHEN ?2 = 'test' THEN 1
           WHEN EXISTS (SELECT 1 FROM subscriptions s WHERE s.contact_id = c.id AND s.list = ?1) THEN 1
           ELSE 0 END AS ok
       FROM deliveries d LEFT JOIN contacts c ON c.id = d.contact_id WHERE d.id IN (${claimed.map((_, i) => `?${i + 3}`).join(', ')})`)
-      .bind(send.list, send.kind, ...claimed).all<Recipient & { id: number; ok: number }>()).results;
+      .bind(send.list, send.kind, ...claimed).all<Recipient & { id: number; ok: number; error: string | null }>()).results;
 
-    const updates = await Promise.all(recipients.map(async r => {
+    // Each row is settled as soon as SES answers, so a Worker that stops halfway leaves only the mails
+    // in flight in sending. A settle that fails three times leaves its row in sending too: it turns
+    // unknown, and SES's delivery event, once it comes, marks it sent (app.ts).
+    const settle = async (sql: string, ...params: (string | number | null)[]) => {
+      for (let attempt = 1; ; attempt++) {
+        try {
+          await env.DB.prepare(sql).bind(...params).run();
+          return;
+        } catch (error) {
+          if (attempt === 3) {
+            console.error(JSON.stringify({ event: 'settle_failed', key, message: String(error).slice(0, 200) }));
+            return;
+          }
+        }
+      }
+    };
+    const refused: { id: number; type: string; again: boolean }[] = [];
+    await Promise.all(recipients.map(async r => {
       if (!r.ok) {
         result.skipped++;
-        return env.DB.prepare(`UPDATE deliveries SET status = 'skipped' WHERE id = ?`).bind(r.id);
+        return settle(`UPDATE deliveries SET status = 'skipped' WHERE id = ?`, r.id);
       }
+      let messageId: string;
       try {
-        const messageId = await sendEmail(env, mailFor(env, send, r));
-        result.sent++;
-        return env.DB.prepare(`UPDATE deliveries SET status = 'sent', message_id = ?, sent_at = ?, error = NULL WHERE id = ?`).bind(messageId, iso(now), r.id);
+        messageId = await sendEmail(env, mailFor(env, send, r));
       } catch (error) {
+        // The Worker's own limit on outgoing requests: this one never left, and nor will the next.
+        const local = !(error instanceof SesError) && /too many subrequests/i.test(String(error));
+        const ses = error instanceof SesError ? error : local ? new SesError(0, 'SubrequestLimit') : null;
         // No answer at all: the request may have reached SES. Unsure, like a 5xx.
-        const outcome = error instanceof SesError ? error.outcome : 'unsure';
-        const why = error instanceof SesError ? error.message : 'network';
+        const outcome = ses?.outcome ?? 'unsure';
+        const why = ses?.message ?? 'network';
         if (outcome === 'recipient') {
           result.failed++;
-          return env.DB.prepare(`UPDATE deliveries SET status = 'failed', error = ? WHERE id = ?`).bind(why, r.id);
+          refused.push({ id: r.id, type: ses!.type, again: r.error === why });
+          return settle(`UPDATE deliveries SET status = 'failed', error = ? WHERE id = ?`, why, r.id);
         }
         // Rather none than two: a person checks and decides (retry-unknown).
-        if (outcome === 'unsure') return env.DB.prepare(`UPDATE deliveries SET status = 'unknown', error = ? WHERE id = ?`).bind(why, r.id);
-        if (outcome === 'account') stop ??= error as SesError;
+        if (outcome === 'unsure') return settle(`UPDATE deliveries SET status = 'unknown', error = ? WHERE id = ?`, why, r.id);
+        if (outcome === 'account') stop ??= why;
         else result.retry++;
-        return env.DB.prepare(`UPDATE deliveries SET status = 'pending', claimed_at = NULL, error = ? WHERE id = ?`).bind(why, r.id);
+        return settle(`UPDATE deliveries SET status = 'pending', claimed_at = NULL, error = ? WHERE id = ?`, why, r.id);
       }
+      result.sent++;
+      return settle(`UPDATE deliveries SET status = 'sent', message_id = ?, sent_at = ?, error = NULL WHERE id = ?`, messageId, iso(now), r.id);
     }));
-    await env.DB.batch(updates);
+    // SES refused every mail of a batch for the same reason: that is the sender, the account or the
+    // content, not the readers (a From SES cannot parse, say). Those rows go back in line, and the send
+    // stops. Once only: rows SES refused the same way before stay failed, so a send whose cause
+    // lasts (content SES will not take) does not stop on them for ever, nor hold up the sends after it.
+    const tried = recipients.filter(r => r.ok).length;
+    if (!stop && refused.length >= 3 && refused.length === tried && new Set(refused.map(f => f.type)).size === 1 && !refused.every(f => f.again)) {
+      await env.DB.prepare(`UPDATE deliveries SET status = 'pending', claimed_at = NULL WHERE status = 'failed' AND id IN (${refused.map(() => '?').join(', ')})`)
+        .bind(...refused.map(f => f.id)).run();
+      stop = `${refused[0].type || 'HTTP'} for every mail in a batch`;
+    }
   }
   // The key, the account or a setting is wrong: every other row would fail the same way, so stop
   // here with the rows back in pending, and let a person fix it and resume.
-  if (stop) throw new HttpError(502, `ses_account_error: ${stop.message}`);
+  if (stop) throw new HttpError(502, `ses_account_error: ${stop}`);
 
   for (const row of (await env.DB.prepare(`SELECT status, COUNT(*) AS n FROM deliveries WHERE send_id = ? AND status IN ('pending', 'unknown', 'sending') GROUP BY status`)
     .bind(send.id).all<{ status: 'pending' | 'unknown' | 'sending'; n: number }>()).results) result[row.status] = row.n;
@@ -242,6 +282,9 @@ export async function retryFailed(env: Env, key: string) {
   return { requeued: r.meta.changes };
 }
 
+// One send's numbers. Opens and clicks are counted for people (unique mails, total events), for
+// mails only machines touched (a scanner, Apple's privacy proxy: src/tracking.ts), and for any.
+// Rates are of mails sent, as fractions; null when nothing was sent.
 export async function stats(env: Env, key: string) {
   const send = await env.DB.prepare('SELECT id, key, list, kind, subject, links, created_at FROM sends WHERE key = ?').bind(key)
     .first<{ id: number; key: string; list: string; kind: Kind; subject: string; links: string; created_at: string }>();
@@ -252,26 +295,41 @@ export async function stats(env: Env, key: string) {
     status[r.status] = r.n;
     recipients += r.n;
   }
-  const events: Record<string, { unique: number; total: number }> = {};
-  for (const r of (await env.DB.prepare(`SELECT e.type, COUNT(*) AS total, COUNT(DISTINCT e.delivery_id) AS uniq
-      FROM events e JOIN deliveries d ON d.id = e.delivery_id WHERE d.send_id = ? GROUP BY e.type`).bind(send.id).all<{ type: string; total: number; uniq: number }>()).results) {
-    events[r.type] = { unique: r.uniq, total: r.total };
-  }
+  // unique and total: people; machine: mails only machines touched; any: unique + machine.
+  type Count = { unique: number; total: number; machine: number; any: number };
+  const counted = `SUM(e.machine = 0) AS total, COUNT(DISTINCT CASE WHEN e.machine = 0 THEN e.delivery_id END) AS uniq, COUNT(DISTINCT e.delivery_id) AS any`;
+  const count = (r?: { total: number; uniq: number; any: number }): Count =>
+    ({ unique: r?.uniq ?? 0, total: r?.total ?? 0, machine: (r?.any ?? 0) - (r?.uniq ?? 0), any: r?.any ?? 0 });
+  const events = new Map((await env.DB.prepare(`SELECT e.type, ${counted}
+      FROM events e JOIN deliveries d ON d.id = e.delivery_id WHERE d.send_id = ? GROUP BY e.type`).bind(send.id)
+    .all<{ type: string; total: number; uniq: number; any: number }>()).results.map(r => [r.type, r]));
   const urls: string[] = JSON.parse(send.links);
-  const clicks = new Map((await env.DB.prepare(`SELECT e.link, COUNT(*) AS total, COUNT(DISTINCT e.delivery_id) AS uniq
-      FROM events e JOIN deliveries d ON d.id = e.delivery_id WHERE d.send_id = ? AND e.type = 'click' GROUP BY e.link`).bind(send.id).all<{ link: number; total: number; uniq: number }>()).results
-    .map(r => [r.link, r]));
-  const none = { unique: 0, total: 0 };
+  const clicks = new Map((await env.DB.prepare(`SELECT e.link, ${counted}
+      FROM events e JOIN deliveries d ON d.id = e.delivery_id WHERE d.send_id = ? AND e.type = 'click' GROUP BY e.link`).bind(send.id)
+    .all<{ link: number; total: number; uniq: number; any: number }>()).results.map(r => [r.link, r]));
+  const once = (type: string) => events.get(type)?.any ?? 0;
+  const sent = status.sent ?? 0;
+  const opens = count(events.get('open')), clickCount = count(events.get('click'));
+  const share = (part: number, whole: number) => whole ? Math.round(10_000 * part / whole) / 10_000 : null;
   return {
     key: send.key, list: send.list, kind: send.kind, subject: send.subject, created_at: send.created_at,
     recipients, status,
-    delivered: events.delivery?.unique ?? 0,
-    bounced: events.bounce?.unique ?? 0,
-    softBounced: events['soft-bounce']?.unique ?? 0,
-    complaints: events.complaint?.unique ?? 0,
-    unsubscribed: events.unsubscribe?.unique ?? 0,
-    opens: events.open ?? none,
-    clicks: events.click ?? none,
-    links: urls.map((url, n) => ({ n, url, unique: clicks.get(n)?.uniq ?? 0, total: clicks.get(n)?.total ?? 0 })),
+    delivered: once('delivery'),
+    bounced: once('bounce'),
+    softBounced: once('soft-bounce'),
+    complaints: once('complaint'),
+    unsubscribed: once('unsubscribe'),
+    opens, clicks: clickCount,
+    rates: {
+      delivered: share(once('delivery'), sent),
+      open: share(opens.any, sent),                 // any open, Apple's proxy too: what most tools report
+      openPeople: share(opens.unique, sent),        // without Apple's proxy and scanners
+      click: share(clickCount.unique, sent),        // people only
+      clickToOpen: share(clickCount.unique, opens.any),
+      unsubscribe: share(once('unsubscribe'), sent),
+      bounce: share(once('bounce'), sent),
+      complaint: share(once('complaint'), sent),
+    },
+    links: urls.map((url, n) => ({ n, url, ...count(clicks.get(n)) })),
   };
 }

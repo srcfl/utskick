@@ -1,6 +1,6 @@
 # Dashboard
 
-`${PUBLIC_URL}/dashboard` shows an admin how the newsletter does: the lists, the sends, the sends that wait for approval, and the latest audit entries. It only reads. It has no form and no button, and no page changes anything.
+`${PUBLIC_URL}/dashboard` shows every member how the mail does: sending health, the lists and how they grow, the sends, the sends that wait for approval, and the latest audit entries. It only reads. It has no form and no button, and no page changes anything.
 
 The code is in `src/dashboard.ts`, the tests in `test/dashboard.test.ts`.
 
@@ -8,18 +8,32 @@ The code is in `src/dashboard.ts`, the tests in `test/dashboard.test.ts`.
 
 ### `/dashboard`
 
-- **Lists**, one row for each list in the config: subscribers, addresses suppressed for that list (those who left it), new subscriptions in the last 30 days, and where they came from (`subscriptions.source`, such as `mailchimp-import` or `ftw-web`). "New" goes by `consented_at`, the time the person signed up, so an import of old subscribers adds none. Under the table: how many addresses are suppressed on every list (hard bounces, spam complaints, addresses Mailchimp cleaned).
-- **Sends**, the latest 25, newest first: key, kind, created, recipients, sent, delivered, unique opens and unique clicks with their share of mails sent, hard bounces, complaints and unsubscribes. Test sends are hidden; `/dashboard?tests=1` shows them. A list without the open pixel (`opens: false` in the config) shows "no pixel" instead of an open rate.
-- **Waiting for approval**: the `request_send` approvals that are pending and not yet expired: the request id, the key, the list, the subject, the recipients when the assistant asked, which assistant asked, which assistants made and last changed the draft it copied, when, and when the request ends. Drafts are shared by every assistant, so the column says when the last change came from another assistant than the one asking. The page cannot link to the approval page. Utskick keeps only the SHA-256 of an approval link ([mcp.md](mcp.md)), and the link itself went to the assistant that asked, so an admin gets it from there.
+- **Sending health, last 30 days**: mails sent to lists and delivered, the hard bounce rate and the complaint rate, each with a level (ok, watch, act now), unsubscribes, and rows that failed or are unknown. Amazon SES reviews an account at 5% hard bounces or 0.1% complaints and may pause it at 10% or 0.5%; the levels warn at 2% and 0.05%. Gmail does not report spam complaints to SES; its spam rate is only in Google Postmaster Tools. If mail went out and no delivery event came back, the page says so: SES's events do not reach Utskick, and bounces and complaints then go unseen. `deliverability` gives the same to an assistant.
+- **Lists**, one row for each list in the config: subscribers, addresses suppressed for that list (those who left it), new subscriptions in the last 30 days, and where they came from (`subscriptions.source`, such as `mailchimp-import` or `ftw-web`). "New" goes by `consented_at`, the time the person signed up, so an import of old subscribers adds none. Under the table: how many addresses are suppressed on every list (hard bounces, spam complaints, addresses Mailchimp cleaned). A list a colleague made through an assistant says so; a deleted one is not shown.
+- **Growth, by month**: for each newsletter, how many joined and how many left in each of the last 12 months, from the `list_changes` table (counts per day and list, nothing about anyone). A sign-up counts in the month the person signed up, so an import fills in the months before it, but only with those still subscribed. `list_growth` gives the same to an assistant.
+- **Sends**, the latest 25, newest first: key, kind, created, recipients, sent, delivered, unique opens and unique clicks with their share of mails sent, hard bounces, complaints and unsubscribes. Opens count any open, as most tools do; clicks count people only. Test sends are hidden; `/dashboard?tests=1` shows them. A list without the open pixel (`opens: false` in the config) shows "no pixel" instead of an open rate.
+- **Waiting for approval**: the `request_send` approvals that are pending and not yet expired: the request id, the key, the list, the subject, the recipients when the assistant asked, which assistant asked, which assistants made and last changed the draft it copied, when, and when the request ends. Drafts are shared by every assistant, so the column says when the last change came from another assistant than the one asking. The page cannot link to the approval page. Utskick keeps only the SHA-256 of an approval link ([mcp.md](mcp.md)); the link itself went to the admins by mail, or to the assistant that asked.
 - **Audit log**: the latest 20 rows of `audit_log`: time, assistant, tool, scope, outcome and the summary of the arguments. What the CLI changed through `/admin` is there too, as `admin-token`, with the route as the tool and counts as the summary.
 
 ### `/dashboard/sends/<key>`
 
-- The numbers from `stats()` in `src/send.ts`, the same that `send_stats` and `node cli/utskick.ts stats <key>` give: recipients, sent, delivered, unique and total opens and clicks, hard and soft bounces, complaints, unsubscribes.
-- Clicks per link as bars, in the order the links come in the mail: how many mails had a click on the link, and their share of mails sent.
+- The numbers from `stats()` in `src/send.ts`, the same that `send_stats` and `node cli/utskick.ts stats <key>` give: recipients, sent, delivered, unique opens (and how many of them only machines made), unique clicks by people (and how many more mails only scanners clicked), click-to-open, hard and soft bounces, complaints, unsubscribes.
+- Clicks per link as bars, in the order the links come in the mail: how many mails had a click on the link by a person, and their share of mails sent.
 - Delivery status: how many rows are sent, pending, sending, unknown, skipped or failed, and what each means. `unknown`: SES may or may not have the mail (no answer, an SES server error, or a run that stopped between SES and the database); check, then `node cli/utskick.ts retry-unknown <key>` sends them again. `failed`: SES refused that address and the mail did not go out; once the cause is fixed (an unverified sender, say), `node cli/utskick.ts retry-failed <key>` puts them back in line.
-- First opens and first clicks over time, as inline SVG: an hour a bar for the 72 hours after the first mail went out, then a day a bar up to day 33. Each mail counts once, at its first open or its first click, so the bars add up to the unique counts. A line under the chart counts any that came after day 33.
+- First opens and first clicks by people over time, as inline SVG: an hour a bar for the 72 hours after the first mail went out, then a day a bar up to day 33. Each mail counts once, at its first open or its first click, so the bars add up to the unique counts. A line under the chart counts any that came after day 33.
 - For a live send, its resends; for a resend, the live send it repeats. Each is a link.
+
+### People and machines
+
+Mail servers and security gateways (Microsoft Defender, Proofpoint, Mimecast, Gmail) follow every link in a mail to check it, often before anyone has read it. Apple Mail's privacy proxy loads every image, the open pixel too, as soon as a mail arrives. On a list of companies that can be most of the clicks. `src/tracking.ts` marks an open or a click as a machine's when it comes:
+
+- from a network of mail scanners, clouds or hosting (Microsoft, Google, Amazon, Proofpoint, Mimecast and the like), or for an open, Apple's;
+- with a user agent that says it is a program, or none;
+- for a click, within 30 seconds of the mail going out, or as the third of a mail's links clicked within 2 seconds.
+
+Web proxies that carry a company's staff (Prisma Access, Zscaler, Forcepoint and the like) count as people. Someone on a cloud desktop (Windows 365, a VPN on AWS) counts as a machine: the rule cannot tell them from a scanner.
+
+Only the yes or no is stored. A machine's click never hides a person's later click on the same link, and one mail logs at most 30 clicks an hour. A resend still skips anyone whose mail was opened or clicked by anything, machine or not, so nobody gets an issue twice.
 
 Every page ends with a note: opens overstate reading. Apple Mail Privacy Protection loads every image in a mail, the open pixel too, as soon as the mail arrives, and Gmail fetches images through its own proxy. Clicks, and replies to the list's reply-to address, are the honest signal. Replies go to that inbox; Utskick never sees them.
 
@@ -27,21 +41,21 @@ A send key must match `[a-z0-9][a-z0-9-]{1,79}`, as when a send is made. Any oth
 
 ## Signing in
 
-The dashboard signs in an admin the way `/oauth/authorize` and `/approve/` do: `signedInAdmin()` in `src/identity.ts`. In production, Cloudflare Access signs the person in, and Utskick checks the JWT that Access adds (`Cf-Access-Jwt-Assertion`) itself: the signature against the team's keys, the issuer, the audience (`access.audience`) and the expiry. It then looks the address up in `admins` in the config. Under `cf dev`, `DEV_IDENTITY` stands in for Access, as [mcp.md](mcp.md) describes.
+The dashboard signs in a member the way `/oauth/authorize` does: `signedInMember()` in `src/identity.ts`. Admins are members too. In production, Cloudflare Access signs the person in, and Utskick checks the JWT that Access adds (`Cf-Access-Jwt-Assertion`) itself: the signature against the team's keys, the issuer, the audience (`access.audience`) and the expiry. It then looks the address up in `members` and `admins` in the config. Under `cf dev`, `DEV_IDENTITY` stands in for Access, as [mcp.md](mcp.md) describes.
 
 - Not signed in: 401, the same "Sign-in needed" page as `/oauth/authorize`. No sign-in set up for the installation: 503.
-- Signed in, but not an admin: 403. Unlike `/oauth/authorize`, this page does not repeat the address.
+- Signed in, but not a member: 403. Unlike `/oauth/authorize`, this page does not repeat the address.
 - Who comes before what: without sign-in, every path under `/dashboard` answers 401, so nobody can probe which send keys exist.
 - Only GET and HEAD. Anything else is a 405.
 
 ### Paths Cloudflare Access must cover
 
-All of them belong to **one** self-hosted Access application for your Utskick host, with a policy that allows the admins' addresses:
+All of them belong to **one** self-hosted Access application for your Utskick host, with a policy that allows everyone in `members`:
 
 | Path | For |
 |---|---|
 | `dashboard` and `dashboard/*` | this dashboard |
-| `oauth/authorize` | an admin connects an assistant |
+| `oauth/authorize` | a member connects an assistant |
 | `approve/*` | an admin approves or declines a send |
 
 Add the two dashboard paths to the application that already holds `oauth/authorize` and `approve`. Utskick accepts one audience (`access.audience`), and a second Access application would have an AUD tag of its own, so its sign-ins would get a 401. As with every change in Cloudflare, this needs the owner's go-ahead ([setup.md](setup.md)).

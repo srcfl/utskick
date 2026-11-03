@@ -68,12 +68,19 @@ test('0003 on an empty database still starts ids at 1', () => {
   assert.equal(db.prepare('SELECT id FROM contacts').get()!.id, 1);
 });
 
-test('the soft-bounce count in the SES webhook reads by index, not the whole events table', () => {
-  const db = current();
-  db.exec(migration('0003_data.sql'));
-  const plan = db.prepare(`EXPLAIN QUERY PLAN SELECT COUNT(DISTINCT e.delivery_id) AS n FROM events e JOIN deliveries d ON d.id = e.delivery_id
-    WHERE e.type = 'soft-bounce' AND d.contact_id = (SELECT contact_id FROM deliveries WHERE message_id = ?)`).all().map(r => r.detail as string);
-  assert.ok(!plan.some(p => /^SCAN/.test(p)), plan.join('\n'));
+test('the soft-bounce count in the SES webhook and the sends side by side read by index, not whole tables', () => {
+  const db = new DatabaseSync(':memory:');
+  for (const f of [...before, '0003_data.sql', '0004_auth.sql', '0005_stats_lists.sql']) db.exec(migration(f));
+  const latest = `SELECT id, key, list, kind, subject, created_at FROM sends WHERE (?1 IS NULL OR list = ?1) AND (?2 OR kind != 'test') ORDER BY id DESC LIMIT ?3`;
+  for (const sql of [
+    `SELECT COUNT(DISTINCT e.delivery_id) AS n FROM events e JOIN deliveries x ON x.id = e.delivery_id
+      WHERE e.type = 'soft-bounce' AND e.detail = 'MailboxFull' AND x.contact_id = ? AND e.at > ?`,
+    `SELECT d.send_id, e.type, COUNT(DISTINCT CASE WHEN e.type != 'click' OR e.machine = 0 THEN e.delivery_id END) AS n
+      FROM deliveries d JOIN events e ON e.delivery_id = d.id WHERE d.send_id IN (SELECT id FROM (${latest})) GROUP BY d.send_id, e.type`,
+  ]) {
+    const plan = db.prepare(`EXPLAIN QUERY PLAN ${sql}`).all().map(r => r.detail as string);
+    assert.ok(!plan.some(p => /^SCAN (e|d|x|deliveries|events)\b/.test(p)), plan.join('\n'));
+  }
 });
 
 // review: the newest contact leaves, the next sign-up got their id, and the old mail then acted on the new person.

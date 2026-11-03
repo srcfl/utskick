@@ -31,11 +31,12 @@ export interface RenderOptions {
 }
 
 export function render(html: string, o: RenderOptions): string {
-  const name = o.firstName?.trim() || o.fallback;
+  const name = escapeHtml(o.firstName?.trim() || o.fallback);
+  // Functions, not strings: a string replacement reads $& and $' in a name as patterns.
   let out = html
-    .replaceAll('*|FNAME|*', escapeHtml(name))
-    .replaceAll('*|UNSUB|*', o.unsubscribeUrl)
-    .replaceAll('*|ARCHIVE|*', o.archiveUrl);
+    .replaceAll('*|FNAME|*', () => name)
+    .replaceAll('*|UNSUB|*', () => o.unsubscribeUrl)
+    .replaceAll('*|ARCHIVE|*', () => o.archiveUrl);
   if (o.links && o.clickUrl) {
     const { links, clickUrl } = o;
     out = out.replace(anchorHref, (all, before, href, after) => {
@@ -48,6 +49,25 @@ export function render(html: string, o: RenderOptions): string {
     out = /<\/body>/i.test(out) ? out.replace(/<\/body>/i, pixel + '</body>') : out + pixel;
   }
   return out;
+}
+
+// A mail to a list needs a link a reader can use to leave it, not just the tag in a comment or in text.
+export function hasUnsubscribeLink(html: string): boolean {
+  return /\shref\s*=\s*["']?\*\|UNSUB\|\*/i.test(stripComments(html));
+}
+
+// Gmail cuts a mail larger than about 102 KB, and with it the footer's unsubscribe link and the open pixel.
+const clipBytes = 100 * 1024;
+
+// What to fix before a mail goes out, as found in its HTML as rendered for one reader.
+export function mailWarnings(source: string, rendered: string): string[] {
+  const warnings: string[] = [];
+  if (!hasUnsubscribeLink(source)) warnings.push('No *|UNSUB|* link: a send to a list is refused without one.');
+  const left = [...new Set(rendered.match(/\*\|[A-Z0-9_:]+\|\*/g) ?? [])];
+  if (left.length) warnings.push(`Merge tags Utskick does not fill, which readers would see as they are: ${left.slice(0, 10).join(', ')}.`);
+  const bytes = new TextEncoder().encode(rendered).length;
+  if (bytes > clipBytes) warnings.push(`The mail is ${Math.round(bytes / 1024)} KB. Gmail cuts mails over about 102 KB, hiding the unsubscribe link and the open pixel.`);
+  return warnings;
 }
 
 // The text/plain part. Mail clients rarely show it, but spam filters look for it.

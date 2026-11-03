@@ -4,13 +4,14 @@
 // (RFC 9207), protected resource metadata for /mcp (RFC 9728), tokens bound to /mcp by the
 // resource parameter (RFC 8707), client ID metadata documents, and dynamic registration (RFC 7591).
 //
-// An admin signs in (identity.ts) and ticks what the assistant may do. Sending to a list is never
+// A member signs in (identity.ts) and ticks what the assistant may do. Sending to a list is never
 // one of those things: the assistant can only ask, and an admin approves each send (approvals.ts).
 import { findClient, randomToken, redirectAllowed, redirectMatches, register, sweepClients, cursorRedirect, type Client } from './clients.ts';
 import type { Env } from './env.ts';
-import { signedInAdmin } from './identity.ts';
+import { isMember, signedInMember } from './identity.ts';
 import { page } from './pages.ts';
 import { escapeHtml } from './render.ts';
+import { boundedText } from './signup.ts';
 import { iso, json, sha256 } from './util.ts';
 
 // What each scope lets an assistant do, as the consent page says it.
@@ -18,7 +19,8 @@ export const scopes = {
   'stats.read': 'See each send’s numbers and clicks per link. Never who got it.',
   'subscribers.read': 'See how many people are on each list. Never who.',
   'drafts.write': 'Write and preview drafts, and ask you to approve sending one to a list.',
-  'test.send': 'Send a draft or an issue as a test, only to the test addresses in the config.',
+  'test.send': 'Send a draft or an issue as a test, only to you and the test addresses in the config.',
+  'lists.write': 'Make lists of people you name, for one mailing, and add or take people off them. Never read who is on a list.',
 } as const;
 export type Scope = keyof typeof scopes;
 export const allScopes = Object.keys(scopes) as Scope[];
@@ -135,19 +137,19 @@ export function messagePage(env: Env, status: number, title: string, text: strin
   return page(env.CONFIG, title, `<h1>${escapeHtml(title)}</h1><p>${escapeHtml(text)}</p>${link}`, status);
 }
 
+// Stops reading at 16 KiB, so a huge body costs nothing to refuse.
 async function readForm(request: Request): Promise<URLSearchParams | null> {
-  const text = await request.text();
-  if (text.length > 16_384) return null;
-  return new URLSearchParams(text);
+  const text = await boundedText(request, 16_384).catch(() => null);
+  return text === null ? null : new URLSearchParams(text);
 }
 
 // --------------------------------------------------------------------------
-// Authorize: an admin approves a client
+// Authorize: a member approves a client
 // --------------------------------------------------------------------------
 
 async function authorize(request: Request, env: Env): Promise<Response> {
   // Who comes first: nothing is fetched or stored for a stranger.
-  const who = await signedInAdmin(request, env);
+  const who = await signedInMember(request, env);
   if (!who.ok) return messagePage(env, who.status, 'Sign-in needed', who.reason);
   const q = new URL(request.url).searchParams;
   for (const k of new Set(q.keys())) {
@@ -213,7 +215,7 @@ function consentPage(env: Env, id: string, email: string, client: Client, redire
 <form method="post">
 <input type="hidden" name="request" value="${id}">
 ${boxes}
-<p class="small">Sending to a list is not one of these. The assistant can only ask, and you approve each send on a page of its own.</p>
+<p class="small">Sending to a list is not one of these. The assistant can only ask, and an admin approves each send on a page of its own.</p>
 <button type="submit" name="decision" value="approve">Approve</button>
 <button type="submit" name="decision" value="deny" style="background:transparent;color:var(--ink);border:1px solid var(--line)">Deny</button>
 </form>
@@ -232,7 +234,7 @@ interface ConsentRow {
 }
 
 async function decide(request: Request, env: Env): Promise<Response> {
-  const who = await signedInAdmin(request, env);
+  const who = await signedInMember(request, env);
   if (!who.ok) return messagePage(env, who.status, 'Sign-in needed', who.reason);
   if (!sameOrigin(request, env)) return messagePage(env, 403, 'This form came from elsewhere', 'Open the link the assistant gave you again.');
   const form = await readForm(request);
@@ -413,6 +415,7 @@ async function refresh(env: Env, form: URLSearchParams, clientId: string): Promi
   const grant = await liveGrant(env, row.grant_id, now);
   if (!grant) return invalidGrant('the grant was revoked');
   if (grant.resource !== resourceOf(env)) return invalidGrant('the grant is for another resource');
+  if (!isMember(env.CONFIG, grant.subject)) return invalidGrant('the person who connected this assistant is no longer a member');
   return issue(env, grant, scope, now, hash);
 }
 
@@ -475,7 +478,7 @@ export interface Grant {
   id: string;
   clientId: string;
   clientName: string;
-  subject: string;  // the admin who approved the client
+  subject: string;  // the member who approved the client
   scopes: Scope[];
 }
 
@@ -499,6 +502,8 @@ export async function authenticate(request: Request, env: Env): Promise<Grant | 
     .first<{ scope: string; resource: string; expires_at: string; id: string; client_id: string; client_name: string; subject: string; grant_expires: string }>();
   if (!row || row.expires_at <= now || row.grant_expires <= now) return invalid;
   if (row.resource !== resourceOf(env)) return { ...invalid, description: 'the access token is for another resource' };
+  // Someone who left, or was taken out of the config, takes their assistants with them.
+  if (!isMember(env.CONFIG, row.subject)) return { ...invalid, description: 'the person who connected this assistant is no longer a member' };
   return { id: row.id, clientId: row.client_id, clientName: row.client_name, subject: row.subject, scopes: scopeList(row.scope.split(' ')) };
 }
 
@@ -524,6 +529,13 @@ export async function adminOAuth(request: Request, env: Env, path: string, body:
   if (request.method === 'GET' && path === '/admin/oauth/grants') {
     const grants = (await env.DB.prepare(`SELECT id, client_id, client_name, subject, scope, created_at, expires_at, used_at FROM oauth_grants ORDER BY created_at DESC`).all()).results;
     return json({ grants });
+  }
+  // Everything one person connected, as when they leave.
+  if (request.method === 'POST' && path === '/admin/oauth/revoke' && typeof body.subject === 'string') {
+    const grants = (await env.DB.prepare('SELECT id FROM oauth_grants WHERE subject = ?').bind(body.subject.trim().toLowerCase()).all<{ id: string }>()).results;
+    for (const g of grants) await revokeGrant(env, g.id);
+    await env.DB.prepare('DELETE FROM oauth_consents WHERE subject = ?').bind(body.subject.trim().toLowerCase()).run();
+    return json({ grants: grants.length });
   }
   if (request.method === 'POST' && path === '/admin/oauth/revoke') {
     const id = body.clientId;
