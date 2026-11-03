@@ -1,7 +1,7 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { handle } from '../src/app.ts';
-import { admin, fakeSes, rows, testEnv } from './helpers.ts';
+import { admin, aged, fakeSes, reader, rows, testEnv } from './helpers.ts';
 
 let ses: ReturnType<typeof fakeSes>;
 afterEach(() => ses?.restore());
@@ -19,11 +19,12 @@ async function sent() {
   await handle(admin('/admin/import', { list: 'the-source', source: 'mailchimp-import', consent: 'mailchimp-the-source', contacts, suppressions: [] }), env);
   await handle(admin('/admin/sends', { key: 'the-source-22', list: 'the-source', kind: 'live', subject: 'The Source #22', html }), env);
   await handle(admin('/admin/sends/the-source-22/batch', { max: 10 }), env);
+  await aged(env);
   const tokens = (await rows(env, 'SELECT token FROM deliveries ORDER BY id')).map(r => r.token as string);
   return { env, tokens };
 }
 
-const get = (path: string, method = 'GET') => new Request(`https://news.test${path}`, { method });
+const get = (path: string, method = 'GET') => reader(`https://news.test${path}`, method);
 
 test('a click redirects to the link and is logged against it', async () => {
   const { env, tokens } = await sent();
@@ -66,11 +67,11 @@ test('stats count unique and total clicks per link, opens, and statuses', async 
   assert.equal(stats.recipients, 3);
   assert.deepEqual(stats.status, { sent: 3 });
   // Repeats within the hour count once (see the next test); the unique figures are what matter.
-  assert.deepEqual(stats.opens, { unique: 1, total: 1 });
-  assert.deepEqual(stats.clicks, { unique: 2, total: 3 });
+  assert.deepEqual(stats.opens, { unique: 1, total: 1, machine: 0, any: 1 });
+  assert.deepEqual(stats.clicks, { unique: 2, total: 3, machine: 0, any: 2 });
   assert.deepEqual(stats.links, [
-    { n: 0, url: 'https://ftw.sourceful.energy', unique: 2, total: 2 },
-    { n: 1, url: 'https://sourceful.energy/master-plan?a=1&b=2', unique: 1, total: 1 },
+    { n: 0, url: 'https://ftw.sourceful.energy', unique: 2, total: 2, machine: 0, any: 2 },
+    { n: 1, url: 'https://sourceful.energy/master-plan?a=1&b=2', unique: 1, total: 1, machine: 0, any: 1 },
   ]);
 });
 
@@ -121,7 +122,7 @@ test('a click on a link with odd characters redirects to its encoded form', asyn
   ses = fakeSes();
   const env = testEnv();
   await handle(admin('/admin/import', { list: 'the-source', source: 'mailchimp-import', consent: 'mailchimp-the-source', contacts: [{ email: 'a@example.com' }], suppressions: [] }), env);
-  await handle(admin('/admin/sends', { key: 'odd', list: 'the-source', kind: 'live', subject: 'S', html: '<a href="https://example.com/smörgås?q=a b">x</a>' }), env);
+  await handle(admin('/admin/sends', { key: 'odd', list: 'the-source', kind: 'live', subject: 'S', html: '<a href="https://example.com/smörgås?q=a b">x</a><a href="*|UNSUB|*">u</a>' }), env);
   await handle(admin('/admin/sends/odd/batch', { max: 10 }), env);
   const [{ token }] = await rows<{ token: string }>(env, 'SELECT token FROM deliveries');
   const res = await handle(get(`/c/${token}/0`), env);

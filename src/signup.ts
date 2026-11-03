@@ -30,9 +30,11 @@ export async function signupRoute(request: Request, env: Env): Promise<Response>
     form = await whichForm(request, env, forms, origin);
     const fields = await readFields(request);
     thanks = thanksPage(fields.redirect, form.config);
-    // For a server form this is the server's address, so the limit caps the server as a whole.
-    const client = clientKey(request.headers.get('CF-Connecting-IP') ?? 'unknown');
-    if (!(await limiter(env).limit({ key: `${form.name}:${client}` })).success) throw new HttpError(429, 'rate_limited');
+    // A server form may name the reader's address in X-Client-IP: its key vouches for it. Without
+    // that header the address is the server's, and the limit caps the server as a whole.
+    const named = form.config.key ? request.headers.get('X-Client-IP') : null;
+    const client = clientKey(named || request.headers.get('CF-Connecting-IP') || 'unknown');
+    if (!await signupAllowed(env, `${form.name}:${client}`)) throw new HttpError(429, 'rate_limited');
     // A filled hidden field means a form-filling bot. Answer as if it worked and store nothing.
     if (!present(fields.website)) await subscribe(env, checkFields(fields, form, env.CONFIG));
     return reply(form, origin, thanks, null);
@@ -206,6 +208,11 @@ function memoryLimiter(max: number, seconds: number): Limiter {
       return { success: ++w.count <= max };
     },
   };
+}
+
+// 10 sign-ups a minute under one key: a form and a client address, or a site over its service binding.
+export async function signupAllowed(env: Env, key: string): Promise<boolean> {
+  return (await limiter(env).limit({ key })).success;
 }
 
 const memory = new WeakMap<Env, Limiter>();

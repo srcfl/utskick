@@ -13,6 +13,8 @@ Open source newsletter sender: Cloudflare Worker + D1 + R2, Amazon SES for deliv
 - Installation-specific values (organization, lists, senders, domain, D1 id) belong in `config/*.json`, never in `src/` or `cloudflare.config.ts`.
 - Schema changes go in a new file under `migrations/`, never by editing an applied one.
 - Pages, logs, stats, MCP tool output and the audit log never show an address or a name.
+- An assistant adds people only to lists it made (`src/lists.ts`). A newsletter from the config takes people only from forms and imports.
+- Opens and clicks keep only a machine-or-not flag (`src/tracking.ts`), never the IP address or user agent it was judged by.
 
 ## Code
 

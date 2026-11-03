@@ -244,7 +244,7 @@ test('a send page: the numbers, clicks per link, statuses, and first opens and c
   for (const [label, value] of [['Recipients', '9'], ['Sent', '9'], ['Delivered', '9'], ['Unique opens', '4'], ['Unique clicks', '2'], ['Hard bounces', '1'], ['Complaints', '1'], ['Unsubscribes', '1']]) {
     assert.match(html, new RegExp(`<div class="label">${label}</div><div class="value">${value}</div>`), label);
   }
-  assert.match(html, /44\.4% of sent · 5 in all/);
+  assert.match(html, /44\.4% of sent · 5 by people in all/);
 
   // Clicks per link, in the order the links appear in the mail.
   const links = [...html.matchAll(/<div class="bar" id="link-(\d+)">([\s\S]*?)<\/div>\s*<\/div>/g)];
@@ -303,7 +303,7 @@ test('everything from the database or the config is escaped', async () => {
   env.CONFIG = { ...testConfig, lists: { ...testConfig.lists, 'the-source': { ...testConfig.lists['the-source'], name: 'The <Source>' } } };
   env.DEV_IDENTITY = 'admin@example.com';
   await post(env, '/admin/import', { list: 'the-source', source: '<i>form</i>', consent: 'c', contacts: [{ email: 'reader0@example.com', consentedAt: '2099-01-01T00:00:00Z' }], suppressions: [] });
-  await post(env, '/admin/sends', { key: 'the-source-1', list: 'the-source', kind: 'live', subject: '<i>Issue</i> & "more"', html: '<a href="https://example.com/?q=&lt;u&gt;x">x</a> *|UNSUB|*' });
+  await post(env, '/admin/sends', { key: 'the-source-1', list: 'the-source', kind: 'live', subject: '<i>Issue</i> & "more"', html: '<a href="https://example.com/?q=&lt;u&gt;x">x</a> <a href="*|UNSUB|*">u</a>' });
   await env.DB.prepare(`INSERT INTO oauth_grants (id, client_id, client_name, subject, scope, resource, expires_at) VALUES ('g', 'evil', '<script>alert(1)</script>', 'admin@example.com', 'drafts.write', 'x', '2099-01-01T00:00:00Z')`).run();
   await env.DB.prepare(`INSERT INTO audit_log (client_id, tool, summary, outcome) VALUES ('evil', '<b>tool</b>', '{"subject":"<img src=x onerror=alert(1)>","to":"reader0@example.com","ref":"0123456789abcdef0123456789abcdef"}', 'ok')`).run();
   await env.DB.prepare(`INSERT INTO approvals (id, token_hash, draft_id, send_key, list, subject, html, recipients, client_id, requested_by, expires_at)

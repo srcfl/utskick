@@ -99,8 +99,8 @@ function emphasis(s: string): string {
     .replace(/(^|\W)_(?=\S)(.+?)(?<=\S)_(?=\W|$)/g, '$1<em>$2</em>');
 }
 
-// A whole email: the content, then links to the web version and to unsubscribe.
-export function markdownToEmail(markdown: string, subject: string): string {
+// A whole email: the content, then links to the web version (where there is one) and to unsubscribe.
+export function markdownToEmail(markdown: string, subject: string, webVersion = true): string {
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -115,7 +115,7 @@ export function markdownToEmail(markdown: string, subject: string): string {
 ${markdownToHtml(markdown)}
 </td></tr>
 <tr><td style="padding:16px 24px 40px;font:13px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;color:#6B7280">
-<a href="*|ARCHIVE|*" style="color:#6B7280">View in your browser</a> &middot; <a href="*|UNSUB|*" style="color:#6B7280">Unsubscribe</a>
+${webVersion ? '<a href="*|ARCHIVE|*" style="color:#6B7280">View in your browser</a> &middot; ' : ''}<a href="*|UNSUB|*" style="color:#6B7280">Unsubscribe</a>
 </td></tr>
 </table>
 </td></tr></table>

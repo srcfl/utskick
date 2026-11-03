@@ -2,6 +2,7 @@
 // document lists its name and redirect URIs (a client ID metadata document), or by registering
 // here (RFC 7591), which ChatGPT and older clients still do. Ported from srcfl/ftw-cloud internal/oauth.
 import type { Env } from './env.ts';
+import { boundedText } from './signup.ts';
 import { HttpError, iso, json, sha256 } from './util.ts';
 
 export interface Client {
@@ -220,7 +221,7 @@ export async function register(request: Request, env: Env): Promise<Response> {
   const source = sourceOf(request);
   if (source && !await allowBurst(env, source, now)) return registerError(429, 'invalid_client_metadata', 'too many registrations; try again shortly');
 
-  const text = await request.text();
+  const text = await boundedText(request, 16_384).catch(() => '');
   let reg: Record<string, any>;
   try { reg = text.length <= 16_384 ? JSON.parse(text) : null; } catch { reg = null as any; }
   if (!reg || typeof reg !== 'object' || Array.isArray(reg)) return registerError(400, 'invalid_client_metadata', 'the body is not a JSON object');

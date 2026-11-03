@@ -3,7 +3,7 @@
 import { isList } from './config.ts';
 import type { Env } from './env.ts';
 import { markdownToEmail } from './markdown.ts';
-import { decodeEntities, render, stripComments, toText, trackedLinks } from './render.ts';
+import { decodeEntities, hasUnsubscribeLink, mailWarnings, render, stripComments, toText, trackedLinks } from './render.ts';
 import { HttpError, iso } from './util.ts';
 
 export interface DraftRow {
@@ -25,7 +25,8 @@ const sampleName = 'Alex';
 export const hex = (bytes: number) => [...crypto.getRandomValues(new Uint8Array(bytes))].map(b => b.toString(16).padStart(2, '0')).join('');
 
 export async function saveDraft(env: Env, clientId: string, a: Record<string, unknown>, now = new Date()) {
-  if (!isList(env.CONFIG, a.list)) throw new HttpError(400, `Unknown list. The lists are: ${Object.keys(env.CONFIG.lists).join(', ')}.`);
+  const open = Object.keys(env.CONFIG.lists).filter(id => !env.CONFIG.lists[id].adhoc?.deleted);
+  if (!isList(env.CONFIG, a.list) || !open.includes(a.list)) throw new HttpError(400, `Unknown list. The lists are: ${open.join(', ')}.`);
   const subject = typeof a.subject === 'string' ? a.subject.trim() : '';
   if (!subject || subject.length > 200) throw new HttpError(400, 'subject must be 1 to 200 characters.');
   const hasHtml = typeof a.html === 'string' && a.html.trim() !== '';
@@ -33,7 +34,9 @@ export async function saveDraft(env: Env, clientId: string, a: Record<string, un
   if (hasHtml === hasMarkdown) throw new HttpError(400, 'Give html or markdown, not both and not neither.');
   const source = (hasHtml ? a.html : a.markdown) as string;
   if (source.length > maxBytes) throw new HttpError(400, `The draft is larger than ${maxBytes / 1024} KiB.`);
-  const html = hasMarkdown ? markdownToEmail(source, subject) : source;
+  // A mailing to a list a colleague made has no public web version (app.ts).
+  const adhoc = !!env.CONFIG.lists[a.list].adhoc;
+  const html = hasMarkdown ? markdownToEmail(source, subject, !adhoc) : source;
   const markdown = hasMarkdown ? source : null;
 
   let id = a.id;
@@ -47,8 +50,14 @@ export async function saveDraft(env: Env, clientId: string, a: Record<string, un
     await env.DB.prepare(`INSERT INTO drafts (id, list, subject, html, markdown, client_id, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(id, a.list, subject, html, markdown, clientId, clientId, iso(now), iso(now)).run();
   }
-  return { id, list: a.list, subject, format: hasMarkdown ? 'markdown' : 'html', bytes: html.length, links: trackedLinks(stripComments(html)).length, unsubscribeLink: html.includes('*|UNSUB|*') };
+  const preview = sample(env, a.list, html);
+  return {
+    id, list: a.list, subject, format: hasMarkdown ? 'markdown' : 'html', bytes: html.length, links: trackedLinks(stripComments(html)).length,
+    unsubscribeLink: hasUnsubscribeLink(html), warnings: [...mailWarnings(html, preview), ...(adhoc && html.includes('*|ARCHIVE|*') ? [webVersionWarning] : [])],
+  };
 }
+
+const webVersionWarning = 'The mail links to *|ARCHIVE|*, but a list made through an assistant has no public web version: the link would lead nowhere. Take it out.';
 
 export async function getDraft(env: Env, id: unknown): Promise<DraftRow> {
   const d = typeof id === 'string' ? await env.DB.prepare('SELECT * FROM drafts WHERE id = ?').bind(id).first<DraftRow>() : null;
@@ -64,19 +73,24 @@ export async function listDrafts(env: Env) {
   return { drafts };
 }
 
-// The draft as a reader would get it, with a sample name, no tracking and no real recipient.
-export async function previewDraft(env: Env, id: unknown) {
-  const d = await getDraft(env, id);
-  const list = env.CONFIG.lists[d.list];
-  const html = render(stripComments(d.html), {
+// A draft's HTML as a reader would get it, with a sample name, no tracking and no real recipient.
+function sample(env: Env, list: string, html: string): string {
+  return render(stripComments(html), {
     firstName: sampleName,
-    fallback: list?.fname ?? 'there',
+    fallback: env.CONFIG.lists[list]?.fname ?? 'there',
     unsubscribeUrl: `${env.PUBLIC_URL}/unsubscribe`,
     archiveUrl: `${env.PUBLIC_URL}/a/preview`,
   });
+}
+
+export async function previewDraft(env: Env, id: unknown) {
+  const d = await getDraft(env, id);
+  const list = env.CONFIG.lists[d.list];
+  const html = sample(env, d.list, d.html);
   return {
     id: d.id, list: d.list, from: list?.from, replyTo: list?.replyTo ?? null, subject: d.subject,
-    html, text: toText(html), links: trackedLinks(stripComments(d.html)), unsubscribeLink: d.html.includes('*|UNSUB|*'),
+    html, text: toText(html), links: trackedLinks(stripComments(d.html)), unsubscribeLink: hasUnsubscribeLink(d.html),
+    warnings: [...mailWarnings(d.html, html), ...(list?.adhoc && d.html.includes('*|ARCHIVE|*') ? [webVersionWarning] : [])],
   };
 }
 
@@ -106,6 +120,8 @@ const hiders: [string, RegExp, RegExp | null][] = [
   ['opacity:0', new RegExp(String.raw`(?:^|[;\s])opacity\s*:\s*${zero}`, 'i'), null],
   ['font-size:0', new RegExp(String.raw`(?:^|[;\s])font-size\s*:\s*${zero}`, 'i'), /font-size\s*:\s*(?!0(?:\.0+)?(?:px|pt|em|rem|%)?\b)[\d.]/i],
   ['far off screen', /(?:^|[;\s])(?:left|top|text-indent|margin-left|margin-top)\s*:\s*-\d{3,}/i, null],
+  ['clipped away', /(?:^|[;\s])clip(?:-path)?\s*:\s*(?:rect\(\s*0(?:px)?[\s,]+0(?:px)?[\s,]+0(?:px)?[\s,]+0(?:px)?\s*\)|inset\(\s*(?:50|100)%)/i, null],
+  ['scaled to nothing', /(?:^|[;\s])transform\s*:\s*scale[xy]?\(\s*0(?:\.0+)?\s*[,)]/i, null],
 ];
 const zeroBox = new RegExp(String.raw`(?:^|[;\s])(?:max-)?(?:height|width)\s*:\s*${zero}`, 'i');
 const tagPattern = /<([a-z][a-z0-9:-]*)\b((?:[^>"']|"[^"]*"|'[^']*')*)>/gi;
@@ -163,15 +179,17 @@ export function inspectMail(source: string): Inspection {
   for (const m of html.matchAll(tagPattern)) {
     const name = m[1].toLowerCase();
     if (voidTags.has(name) || m.index! < bodyAt || found.some(f => m.index! > f.start && m.index! < f.end)) continue;
-    const style = attributes(m[0], ['style']).join(';');
-    const attribute = /\shidden(?:\s|=|>|\/)/i.test(m[0]);
+    // CSS comments go first: display:/**/none hides as well as display:none.
+    const style = attributes(m[0], ['style']).join(';').replace(/\/\*[\s\S]*?\*\//g, '');
+    // A <template> never shows, whatever its style.
+    const attribute = /\shidden(?:\s|=|>|\/)/i.test(m[0]) || name === 'template';
     const candidates = hiders.filter(([, hides]) => hides.test(style));
     const boxed = zeroBox.test(style) && /overflow\s*:\s*hidden/i.test(style);
     if (!attribute && !candidates.length && !boxed) continue;
     const start = m.index! + m[0].length;
     const end = closeOf(html, name, start);
     const inner = html.slice(start, end);
-    const why = attribute ? 'the hidden attribute'
+    const why = attribute ? (name === 'template' ? 'a template' : 'the hidden attribute')
       : candidates.find(([, , shows]) => !(shows && shows.test(inner)))?.[0] ?? (boxed ? 'zero size' : '');
     if (why && (textOf(inner) || /\s(?:href|action)\s*=/i.test(inner))) found.push({ why, start: m.index!, end, inner });
   }

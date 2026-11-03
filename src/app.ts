@@ -5,7 +5,7 @@ import { approvalRoute } from './approvals.ts';
 import { audit } from './audit.ts';
 import { dashboardRoute } from './dashboard.ts';
 import type { Env } from './env.ts';
-import { forget, forgetStatements, importContacts } from './contacts.ts';
+import { forgetStatements, importContacts } from './contacts.ts';
 import { mcpRoute } from './mcp.ts';
 import { adminOAuth, oauthRoute } from './oauth.ts';
 import { archiveUnsubscribePage, confirmPage, donePage, notFound, testDonePage } from './pages.ts';
@@ -13,7 +13,9 @@ import { render } from './render.ts';
 import { createSend, retryFailed, retryUnknown, runBatch, stats } from './send.ts';
 import { isSnsUrl, regionOf, verifySns, type SnsMessage } from './sns.ts';
 import { boundedText, signupRoute } from './signup.ts';
-import { HttpError, iso, json, sameSecret } from './util.ts';
+import { burstLinks, burstMs, machineClick, machineOpen } from './tracking.ts';
+import { withLists } from './lists.ts';
+import { HttpError, iso, json, normalizeEmail, sameSecret, sha256 } from './util.ts';
 
 const token = '([0-9a-f]{32})';
 const routes: [string, RegExp, (env: Env, request: Request, m: string[]) => Promise<Response>][] = [
@@ -31,6 +33,9 @@ const routes: [string, RegExp, (env: Env, request: Request, m: string[]) => Prom
 export async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   try {
+    // Lists colleagues made through an assistant join the config's for this request. Clicks, opens,
+    // images and SES's events need no list, and come too often to read them for nothing.
+    if (!/^\/(?:c|o|img|hooks)\//.test(url.pathname)) env = await withLists(env);
     if (url.pathname.startsWith('/admin/')) return await adminRoute(request, env, url.pathname);
     if (url.pathname === '/mcp') return await mcpRoute(request, env);
     if (url.pathname.startsWith('/oauth/') || url.pathname.startsWith('/.well-known/')) {
@@ -49,14 +54,15 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     return notFound(env.CONFIG);
   } catch (error) {
     if (error instanceof HttpError) return json({ error: error.message }, error.status);
-    console.error(JSON.stringify({ event: 'error', path: url.pathname, message: String(error) }));
+    // A reader's token in the path would let whoever reads the log unsubscribe them.
+    console.error(JSON.stringify({ event: 'error', path: url.pathname.replace(/[0-9a-f]{32}/g, '[token]'), message: String(error) }));
     return json({ error: 'internal' }, 500);
   }
 }
 
 async function delivery(env: Env, t: string) {
-  return env.DB.prepare(`SELECT d.id, d.contact_id, s.list, s.kind, s.links FROM deliveries d JOIN sends s ON s.id = d.send_id WHERE d.token = ?`)
-    .bind(t).first<{ id: number; contact_id: number; list: string; kind: string; links: string }>();
+  return env.DB.prepare(`SELECT d.id, d.contact_id, d.sent_at, s.list, s.kind, s.links FROM deliveries d JOIN sends s ON s.id = d.send_id WHERE d.token = ?`)
+    .bind(t).first<{ id: number; contact_id: number; sent_at: string | null; list: string; kind: string; links: string }>();
 }
 
 const listName = (env: Env, list: string) => env.CONFIG.lists[list]?.name ?? list;
@@ -91,33 +97,49 @@ async function click(env: Env, request: Request, [, t, n]: string[]) {
   // Some link scanners send HEAD first; only a GET is someone clicking.
   let target: string;
   try { target = new URL(url).href; } catch { return notFound(env.CONFIG); }
-  if (request.method === 'GET') await env.DB.prepare(`INSERT INTO events (delivery_id, type, link) SELECT ?1, 'click', ?2
-    WHERE NOT EXISTS (SELECT 1 FROM events WHERE delivery_id = ?1 AND type = 'click' AND link = ?2 AND at > ?3)`)
-    .bind(d.id, Number(n), iso(new Date(Date.now() - eventWindowMs))).run();
+  if (request.method === 'GET') {
+    const now = Date.now();
+    // A scanner's click must not hide the person's own, later one: each is counted apart.
+    const machine = machineClick(request, d.sent_at, now) ? 1 : 0;
+    // A machine's click needs no row where any click is; a person's, none where a person's is. And
+    // whatever turns into what, one mail logs at most so many clicks an hour.
+    await env.DB.prepare(`INSERT INTO events (delivery_id, type, link, machine) SELECT ?1, 'click', ?2, ?4
+      WHERE NOT EXISTS (SELECT 1 FROM events WHERE delivery_id = ?1 AND type = 'click' AND link = ?2 AND machine <= ?4 AND at > ?3)
+        AND (SELECT COUNT(*) FROM events WHERE delivery_id = ?1 AND type = 'click' AND at > ?3) < ?5`)
+      .bind(d.id, Number(n), iso(new Date(now - eventWindowMs)), machine, clicksPerHour).run();
+    // A scanner follows each link in turn, within seconds; a person does not. Such a run is all machine.
+    if (!machine) await env.DB.prepare(`UPDATE events SET machine = 1 WHERE delivery_id = ?1 AND type = 'click' AND at >= ?2
+        AND (SELECT COUNT(DISTINCT link) FROM events WHERE delivery_id = ?1 AND type = 'click' AND at >= ?2) >= ?3`)
+      .bind(d.id, iso(new Date(now - burstMs)), burstLinks).run();
+  }
   return new Response(null, { status: 302, headers: { Location: target, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' } });
 }
 
-// At most one open per mail, and one click per mail and link, an hour: a loop on one token cannot
-// fill the database, and the counts that matter (unique opens and clicks) stay the same.
+// At most one open per mail, and one click per mail and link, an hour, for people and for machines
+// each, and 30 clicks a mail in all: a loop on one token cannot fill the database, and the unique
+// counts stay the same.
 const eventWindowMs = 60 * 60 * 1000;
+const clicksPerHour = 30;
 
 // A 1×1 transparent GIF.
 const gif = Uint8Array.from(atob('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'), c => c.charCodeAt(0));
 
-async function open(env: Env, _: Request, [, t]: string[]) {
+async function open(env: Env, request: Request, [, t]: string[]) {
   const d = await env.DB.prepare('SELECT id FROM deliveries WHERE token = ?').bind(t).first<{ id: number }>();
-  if (d) await env.DB.prepare(`INSERT INTO events (delivery_id, type) SELECT ?1, 'open'
-    WHERE NOT EXISTS (SELECT 1 FROM events WHERE delivery_id = ?1 AND type = 'open' AND at > ?2)`)
-    .bind(d.id, iso(new Date(Date.now() - eventWindowMs))).run();
+  const machine = machineOpen(request) ? 1 : 0;
+  if (d) await env.DB.prepare(`INSERT INTO events (delivery_id, type, machine) SELECT ?1, 'open', ?3
+    WHERE NOT EXISTS (SELECT 1 FROM events WHERE delivery_id = ?1 AND type = 'open' AND machine = ?3 AND at > ?2)`)
+    .bind(d.id, iso(new Date(Date.now() - eventWindowMs)), machine).run();
   return new Response(gif, { headers: { 'Content-Type': 'image/gif', 'Cache-Control': 'no-store, max-age=0' } });
 }
 
 // The issue as a web page, for sharing: no name, no tracking, no personal unsubscribe link.
 async function archive(env: Env, _: Request, [, key]: string[]) {
-  const send = await env.DB.prepare(`SELECT html, fname_fallback FROM sends s WHERE key = ? AND kind = 'live'
+  const send = await env.DB.prepare(`SELECT html, list, fname_fallback FROM sends s WHERE key = ? AND kind = 'live'
       AND EXISTS (SELECT 1 FROM deliveries d WHERE d.send_id = s.id AND d.status = 'sent')`)
-    .bind(key).first<{ html: string; fname_fallback: string }>();
-  if (!send) return notFound(env.CONFIG);
+    .bind(key).first<{ html: string; list: string; fname_fallback: string }>();
+  // A mailing to people a colleague named (an event's guests) is theirs, not the public's.
+  if (!send || env.CONFIG.lists[send.list]?.adhoc) return notFound(env.CONFIG);
   const html = render(send.html, { firstName: null, fallback: send.fname_fallback, unsubscribeUrl: `${env.PUBLIC_URL}/unsubscribe`, archiveUrl: `${env.PUBLIC_URL}/a/${key}` });
   // The issue is shown as it was sent, on the same origin as the admin pages, so it runs in a sandbox:
   // no scripts, no forms, no same-origin access, whatever the HTML holds.
@@ -133,7 +155,11 @@ async function archive(env: Env, _: Request, [, key]: string[]) {
 async function image(env: Env, _: Request, [, name]: string[]) {
   const object = await env.IMAGES?.get(name);
   if (!object) return notFound(env.CONFIG);
-  return new Response(object.body, { headers: { 'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream', 'Cache-Control': 'public, max-age=31536000, immutable' } });
+  return new Response(object.body, { headers: {
+    'Content-Type': object.httpMetadata?.contentType ?? 'application/octet-stream',
+    'Cache-Control': 'public, max-age=31536000, immutable',
+    'X-Content-Type-Options': 'nosniff',
+  } });
 }
 
 // SES publishes bounces, complaints and deliveries to an SNS topic, and SNS posts them here.
@@ -155,31 +181,87 @@ async function sesWebhook(env: Env, request: Request) {
   }
   if (m.Type !== 'Notification') return json({ ok: true });
 
-  const event = JSON.parse(m.Message);
+  let event: SesEvent;
+  try { event = JSON.parse(m.Message); } catch { return json({ ignored: 'not_json' }); }
+  if (!event || typeof event !== 'object') return json({ ignored: 'not_json' });
   const type = event.eventType ?? event.notificationType;
-  const messageId: string | undefined = event.mail?.messageId;
-  const log = (t: string) => env.DB.prepare(`INSERT INTO events (delivery_id, type) SELECT id, ? FROM deliveries WHERE message_id = ?`).bind(t, messageId ?? '').run();
+  const d = await deliveryOf(env, event);
+  const log = (t: string, detail: string | null = null) => d ? env.DB.prepare(`INSERT INTO events (delivery_id, type, detail) VALUES (?, ?, ?)`).bind(d.id, t, detail).run() : null;
+  // Each SES call has one recipient, so the delivery says whose mail it was; its contact may be gone
+  // already (a reader who reports spam and unsubscribes at once), and then the mail's destination,
+  // which SES itself writes, does. The addresses in the bounce or complaint come from the receiving
+  // server's report, which its owner writes: they count only for a mail Utskick cannot place (an
+  // approval notice), and only where they match the destination.
+  const sentTo = normalizeEmail(event.mail?.destination?.[0]);
+  const whose = async (named: { emailAddress?: string }[] | undefined) => {
+    if (d) return d.email_hash ? [d.email_hash] : sentTo ? [await sha256(sentTo)] : [];
+    const destination = new Set((event.mail?.destination ?? []).map(normalizeEmail));
+    const hashes: string[] = [];
+    for (const r of named ?? []) {
+      const e = normalizeEmail(r.emailAddress);
+      if (e && destination.has(e)) hashes.push(await sha256(e));
+    }
+    return hashes;
+  };
+  const suppress = async (hashes: string[], reason: 'bounce' | 'complaint') => {
+    for (const hash of hashes) await env.DB.batch(forgetStatements(env.DB, hash, '*', reason));
+  };
   if (type === 'Bounce') {
     const permanent = event.bounce?.bounceType === 'Permanent';
-    await log(permanent ? 'bounce' : 'soft-bounce');
-    // A hard bounce stops mail at once. A soft one (a full mailbox) only when it is the second mail to bounce.
-    const softBounced = permanent ? 0 : await env.DB.prepare(`SELECT COUNT(DISTINCT e.delivery_id) AS n FROM events e JOIN deliveries d ON d.id = e.delivery_id
-      WHERE e.type = 'soft-bounce' AND d.contact_id = (SELECT contact_id FROM deliveries WHERE message_id = ?)`).bind(messageId ?? '').first<number>('n');
-    if (permanent || (softBounced ?? 0) >= 2) for (const r of event.bounce?.bouncedRecipients ?? []) await forget(env, r.emailAddress, '*', 'bounce');
+    const subtype = typeof event.bounce?.bounceSubType === 'string' && /^[A-Za-z]{1,40}$/.test(event.bounce.bounceSubType) ? event.bounce.bounceSubType : null;
+    await log(permanent ? 'bounce' : 'soft-bounce', subtype);
+    // A hard bounce stops mail at once. A full mailbox does when it is the second mail in 30 days
+    // to bounce for that. Other soft bounces (a server that is busy, or slow to trust a new sender)
+    // say nothing about the address.
+    let again = false;
+    if (!permanent && d && event.bounce?.bounceSubType === 'MailboxFull') {
+      again = (await env.DB.prepare(`SELECT COUNT(DISTINCT e.delivery_id) AS n FROM events e JOIN deliveries x ON x.id = e.delivery_id
+        WHERE e.type = 'soft-bounce' AND e.detail = 'MailboxFull' AND x.contact_id = ? AND e.at > ?`).bind(d.contact_id, iso(new Date(Date.now() - 30 * 86_400_000))).first<number>('n') ?? 0) >= 2;
+    }
+    if (permanent || again) await suppress(await whose(event.bounce?.bouncedRecipients), 'bounce');
   } else if (type === 'Complaint') {
     await log('complaint');
-    for (const r of event.complaint?.complainedRecipients ?? []) await forget(env, r.emailAddress, '*', 'complaint');
+    await suppress(await whose(event.complaint?.complainedRecipients), 'complaint');
   } else if (type === 'Delivery') {
     await log('delivery');
   }
   return json({ ok: true });
 }
 
+interface SesEvent {
+  eventType?: string;
+  notificationType?: string;
+  mail?: { messageId?: string; destination?: string[]; tags?: Record<string, string[]> };
+  bounce?: { bounceType?: string; bounceSubType?: string; bouncedRecipients?: { emailAddress?: string }[] };
+  complaint?: { complainedRecipients?: { emailAddress?: string }[] };
+}
+
+// The delivery an event is about, by SES's message id. A row whose settle never landed (send.ts)
+// has no message id yet: it is found by the send's tag and the address it went to, and marked sent,
+// since SES's event shows it took the mail.
+async function deliveryOf(env: Env, event: SesEvent) {
+  const messageId = event.mail?.messageId;
+  if (typeof messageId !== 'string' || !messageId) return null;
+  const select = `SELECT d.id, d.contact_id, c.email_hash FROM deliveries d LEFT JOIN contacts c ON c.id = d.contact_id`;
+  type Row = { id: number; contact_id: number; email_hash: string | null };
+  const found = await env.DB.prepare(`${select} WHERE d.message_id = ?`).bind(messageId).first<Row>();
+  if (found) return found;
+  const key = event.mail?.tags?.send?.[0];
+  const to = normalizeEmail(event.mail?.destination?.[0]);
+  if (typeof key !== 'string' || !to) return null;
+  const healed = await env.DB.prepare(`UPDATE deliveries SET status = 'sent', message_id = ?1, sent_at = COALESCE(sent_at, ?2), error = NULL
+      WHERE send_id = (SELECT id FROM sends WHERE key = ?3) AND contact_id = (SELECT id FROM contacts WHERE email = ?4)
+        AND status IN ('sending', 'unknown') AND message_id IS NULL RETURNING id`).bind(messageId, iso(new Date()), key, to).first<{ id: number }>();
+  return healed ? env.DB.prepare(`${select} WHERE d.id = ?`).bind(healed.id).first<Row>() : null;
+}
+
 // The CLI's API, with the admin token. Every call that changes something is a row in the audit
 // log, as client admin-token: the route, its outcome and counts, never an address or a body.
 // Reads, dry runs and unknown routes change nothing and leave no row.
 async function adminRoute(request: Request, env: Env, path: string) {
-  if (!env.ADMIN_TOKEN || !await sameSecret(request.headers.get('Authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return json({ error: 'unauthorized' }, 401);
+  // A short token is a guessable one; only a local Worker may have one (.dev.vars.example).
+  if (!env.ADMIN_TOKEN || (env.ADMIN_TOKEN.length < 32 && !localUrl(env.PUBLIC_URL))) return json({ error: 'admin_token_too_short' }, 503);
+  if (!await sameSecret(request.headers.get('Authorization') ?? '', `Bearer ${env.ADMIN_TOKEN}`)) return json({ error: 'unauthorized' }, 401);
   let body: Record<string, any> = {};
   if (request.method === 'POST') {
     let parsed: unknown = null;
@@ -204,6 +286,10 @@ async function adminRoute(request: Request, env: Env, path: string) {
   if (res.status !== 404 && !quiet) await logged(res.status, await res.clone().json().catch(() => ({})) as Record<string, unknown>);
   return res;
 }
+
+const localUrl = (url: string) => {
+  try { return /^(localhost|127\.0\.0\.1|\[::1\])$|\.test$/.test(new URL(url).hostname); } catch { return false; }
+};
 
 // What the audit keeps of an admin call: the list, key or client it named, how many items each
 // array held (contacts, suppressions, test addresses), and the numbers in the answer.

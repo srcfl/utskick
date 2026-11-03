@@ -1,6 +1,8 @@
-// Who is at the browser when an admin connects an assistant or approves a send.
-// Utskick keeps no accounts or passwords. An identity provider says whose browser it is;
-// config.admins says whether that person may act. docs/mcp.md has passkeys as an alternative.
+// Who is at the browser when someone connects an assistant, reads the dashboard or approves a send.
+// Utskick keeps no accounts or passwords. An identity provider says whose browser it is; the config
+// says what that person may do: a member connects an assistant and reads the numbers, an admin also
+// approves sends. docs/mcp.md has passkeys as an alternative.
+import type { Config } from './config.ts';
 import type { Env } from './env.ts';
 import { normalizeEmail } from './util.ts';
 
@@ -20,14 +22,38 @@ export function provider(env: Env): IdentityProvider | null {
   return null;
 }
 
+export function isAdmin(config: Config, email: string): boolean {
+  return (config.admins ?? []).map(normalizeEmail).includes(email);
+}
+
+// An entry is an address, or "@example.com" for everyone at that domain (not its subdomains).
+// The check runs on every call an assistant makes, so taking someone out of the config, or out of
+// the domain's mail, ends what their assistant may do.
+export function isMember(config: Config, email: string): boolean {
+  if (isAdmin(config, email)) return true;
+  return (config.members ?? []).some(entry => {
+    const m = entry.trim().toLowerCase();
+    return m.startsWith('@') ? m.length > 1 && email.endsWith(m) : normalizeEmail(m) === email;
+  });
+}
+
 // The admin at the browser, or why not.
-export async function signedInAdmin(request: Request, env: Env): Promise<SignIn> {
+export function signedInAdmin(request: Request, env: Env): Promise<SignIn> {
+  return signedIn(request, env, 'admin');
+}
+
+// A member (admins are members too) at the browser, or why not.
+export function signedInMember(request: Request, env: Env): Promise<SignIn> {
+  return signedIn(request, env, 'member');
+}
+
+async function signedIn(request: Request, env: Env, role: 'admin' | 'member'): Promise<SignIn> {
   const p = provider(env);
   if (!p) return { ok: false, status: 503, reason: 'Sign-in is not set up for this installation.' };
   const email = await p.email(request, env);
   if (!email) return { ok: false, status: 401, reason: 'Utskick could not tell who you are. Sign in again.' };
-  const admins = (env.CONFIG.admins ?? []).map(normalizeEmail);
-  if (!admins.includes(email)) return { ok: false, status: 403, reason: `${email} is not an admin of this installation.` };
+  const allowed = role === 'admin' ? isAdmin(env.CONFIG, email) : isMember(env.CONFIG, email);
+  if (!allowed) return { ok: false, status: 403, reason: `${email} is not ${role === 'admin' ? 'an admin' : 'a member'} of this installation.` };
   return { ok: true, email };
 }
 

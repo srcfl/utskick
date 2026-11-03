@@ -41,9 +41,22 @@
   "admins": [
     "fredrik@sourceful-labs.com"
   ],
+  "members": [
+    "@sourceful-labs.com",
+    "@sourceful.energy"
+  ],
   "testAllowlist": [
     "fredrik@sourceful-labs.com"
   ],
+  "adhoc": {
+    "from": "Sourceful Energy <hello@news.sourceful.energy>",
+    "opens": false,
+    "fname": "there"
+  },
+  "approval": {
+    "hours": 24,
+    "notifyFrom": "Utskick <utskick@news.sourceful.energy>"
+  },
   "access": {
     "teamDomain": "sourceful.cloudflareaccess.com",
     "audience": "83aeb3bf704fc1e26213a621c0c2ed12c788e21a502f2195fb8d3d5aa906d56f"

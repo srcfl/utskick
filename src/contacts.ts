@@ -9,12 +9,24 @@ type Reason = 'unsubscribe' | 'bounce' | 'complaint' | 'mailchimp-unsubscribed' 
 // Bounces and spam complaints count for every list; leaving a list counts for that list.
 const global: Reason[] = ['bounce', 'complaint', 'mailchimp-cleaned'];
 
+// list_changes counts, per day and list, who joined and who left (migrations/0005). Counts only.
+// Each statement runs before the change it counts, in the same batch, and counts only a real change.
+export function joinedStatement(db: D1Database, list: string, email: string, hash: string, day: string): D1PreparedStatement {
+  return db.prepare(`INSERT INTO list_changes (day, list, joined) SELECT ?1, ?2, 1
+    WHERE NOT EXISTS (SELECT 1 FROM subscriptions s JOIN contacts c ON c.id = s.contact_id WHERE c.email = ?3 AND s.list = ?2)
+      AND NOT EXISTS (SELECT 1 FROM suppressions x WHERE x.email_hash = ?4 AND x.scope IN (?2, '*'))
+    ON CONFLICT (day, list) DO UPDATE SET joined = joined + 1`).bind(day, list, email, hash);
+}
+
 // Suppresses the hash, then deletes the address from the lists the scope covers,
 // and the address itself once it is on no list. `at` keeps the original time, e.g. an import's UNSUB_TIME.
 export function forgetStatements(db: D1Database, hash: string, scope: Scope, reason: Reason, at: string | null = null): D1PreparedStatement[] {
   return [
     db.prepare(`INSERT OR IGNORE INTO suppressions (email_hash, scope, reason, created_at)
       VALUES (?, ?, ?, COALESCE(?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')))`).bind(hash, scope, reason, at),
+    db.prepare(`INSERT INTO list_changes (day, list, departed) SELECT strftime('%Y-%m-%d', 'now'), s.list, 1 FROM subscriptions s
+      WHERE s.contact_id = (SELECT id FROM contacts WHERE email_hash = ?1) AND (?2 = '*' OR s.list = ?2)
+      ON CONFLICT (day, list) DO UPDATE SET departed = departed + 1`).bind(hash, scope),
     db.prepare(`DELETE FROM subscriptions WHERE contact_id = (SELECT id FROM contacts WHERE email_hash = ?) AND (? = '*' OR list = ?)`).bind(hash, scope, scope),
     db.prepare('DELETE FROM contacts WHERE email_hash = ? AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE contact_id = contacts.id)').bind(hash),
   ];
@@ -62,8 +74,8 @@ export async function importContacts(env: Env, body: ImportBody, now = new Date(
   const forget = rows.filter(r => !newer(r));
   for (let i = 0; i < forget.length; i += 100) {
     const results = await env.DB.batch(forget.slice(i, i + 100).flatMap(r => forgetStatements(env.DB, r.hash, r.scope, r.reason, r.at)));
-    // Three statements a row; the first is the suppression, and changes 0 when it was there already.
-    for (let j = 0; j < results.length; j += 3) result.suppressed += results[j].meta.changes;
+    // Four statements a row; the first is the suppression, and changes 0 when it was there already.
+    for (let j = 0; j < results.length; j += 4) result.suppressed += results[j].meta.changes;
   }
 
   const blocked = new Set((await env.DB.prepare(`SELECT email_hash FROM suppressions WHERE scope IN (?, '*')`).bind(list).all<{ email_hash: string }>()).results.map(r => r.email_hash));
@@ -72,17 +84,22 @@ export async function importContacts(env: Env, body: ImportBody, now = new Date(
     const email = normalizeEmail(c.email);
     const hash = email && await sha256(email);
     if (!email || !hash || blocked.has(hash)) { result.skipped++; continue; }
+    const consentedAt = c.consentedAt || iso(now);
     statements.push(
+      // A name goes into every greeting, so a name a bot typed into an old form ("Win at http://…") is dropped.
       env.DB.prepare(`INSERT INTO contacts (email, email_hash, first_name, last_name) VALUES (?, ?, ?, ?)
         ON CONFLICT (email) DO UPDATE SET first_name = COALESCE(excluded.first_name, contacts.first_name), last_name = COALESCE(excluded.last_name, contacts.last_name)`)
-        .bind(email, hash, c.firstName?.trim() || null, c.lastName?.trim() || null),
+        .bind(email, hash, firstName(c.firstName), firstName(c.lastName)),
+      // Growth counts each person on the day they signed up, as the export says.
+      joinedStatement(env.DB, list, email, hash, consentedAt.slice(0, 10)),
       env.DB.prepare(`INSERT OR IGNORE INTO subscriptions (contact_id, list, consent, consented_at, source) SELECT id, ?, ?, ?, ? FROM contacts WHERE email = ?`)
-        .bind(list, body.consent, c.consentedAt || iso(now), body.source, email),
+        .bind(list, body.consent, consentedAt, body.source, email),
     );
   }
-  for (let i = 0; i < statements.length; i += 200) {
-    const results = await env.DB.batch(statements.slice(i, i + 200));
-    for (let j = 1; j < results.length; j += 2) results[j].meta.changes ? result.subscribed++ : result.already++;
+  // Three statements a contact; the third is the subscription.
+  for (let i = 0; i < statements.length; i += 210) {
+    const results = await env.DB.batch(statements.slice(i, i + 210));
+    for (let j = 2; j < results.length; j += 3) results[j].meta.changes ? result.subscribed++ : result.already++;
   }
   return result;
 }
@@ -117,12 +134,15 @@ export async function subscribe(env: Env, s: Signup, now = new Date()): Promise<
   if (typeof s.consent !== 'string' || !s.consent || s.consent.length > 64) throw new Error('invalid_consent');
   const country = typeof s.country === 'string' && /^[A-Z]{2}$/.test(s.country) ? s.country : null;
   const hash = await sha256(email);
-  if (await env.DB.prepare(`SELECT 1 FROM suppressions WHERE email_hash = ? AND scope IN (?, '*')`).bind(hash, list).first()) return { ok: true };
+  // One batch whatever the address, with the suppression checked in each insert: a suppressed
+  // address takes as long as a new one, so the time of the answer tells nothing either.
+  const free = `NOT EXISTS (SELECT 1 FROM suppressions WHERE email_hash = ?2 AND scope IN (?3, '*'))`;
   await env.DB.batch([
-    env.DB.prepare(`INSERT INTO contacts (email, email_hash, first_name, country) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`)
-      .bind(email, hash, firstName(s.firstName), country),
-    env.DB.prepare(`INSERT INTO subscriptions (contact_id, list, consent, consented_at, source) SELECT id, ?, ?, ?, ? FROM contacts WHERE email = ?
-      ON CONFLICT DO NOTHING`).bind(list, s.consent, iso(now), source, email),
+    joinedStatement(env.DB, list, email, hash, iso(now).slice(0, 10)),
+    env.DB.prepare(`INSERT INTO contacts (email, email_hash, first_name, country) SELECT ?1, ?2, ?4, ?5 WHERE ${free} ON CONFLICT DO NOTHING`)
+      .bind(email, hash, list, firstName(s.firstName), country),
+    env.DB.prepare(`INSERT INTO subscriptions (contact_id, list, consent, consented_at, source) SELECT id, ?3, ?4, ?5, ?6 FROM contacts WHERE email = ?1 AND ${free}
+      ON CONFLICT DO NOTHING`).bind(email, hash, list, s.consent, iso(now), source),
   ]);
   return { ok: true };
 }

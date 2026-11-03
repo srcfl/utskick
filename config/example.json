@@ -34,9 +34,21 @@
   "admins": [
     "you@example.com"
   ],
+  "members": [
+    "@example.com"
+  ],
   "testAllowlist": [
     "you@example.com"
   ],
+  "adhoc": {
+    "from": "Example Org <hello@news.example.com>",
+    "opens": false,
+    "fname": "there"
+  },
+  "approval": {
+    "hours": 24,
+    "notifyFrom": "Utskick <utskick@news.example.com>"
+  },
   "access": {
     "teamDomain": "your-team.cloudflareaccess.com",
     "audience": "the-AUD-tag-of-your-Access-application"

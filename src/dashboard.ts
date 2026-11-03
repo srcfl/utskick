@@ -1,16 +1,18 @@
-// A read-only view for admins of how the newsletter does: lists, sends, approvals that wait,
-// and the latest audit entries. Counts only: no address, name, token or message id reaches the
-// page. Admins sign in as on /oauth/authorize and /approve/ (src/identity.ts). docs/dashboard.md.
+// A read-only view for members of how the mail does: sending health, lists and their growth, sends,
+// approvals that wait, and the latest audit entries. Counts only: no address, name, token or
+// message id reaches the page. Members sign in as on /oauth/authorize (src/identity.ts). docs/dashboard.md.
 import type { Env } from './env.ts';
-import { signedInAdmin } from './identity.ts';
+import { signedInMember } from './identity.ts';
 import { messagePage } from './oauth.ts';
 import { escapeHtml } from './render.ts';
 import { stats } from './send.ts';
+import { deliverability, listGrowth } from './stats.ts';
 import { HttpError, iso } from './util.ts';
 
 const keyPattern = /^[a-z0-9][a-z0-9-]{1,79}$/;
 // Each send shown costs a read of its deliveries and events, so the overview keeps to the latest.
 const sendsShown = 25;
+const growthMonths = 12;
 const auditShown = 20;
 // The timeline: an hour a bar for the first 72 hours, when most reading happens, then a day a bar.
 const hourly = 72;
@@ -41,11 +43,11 @@ export async function dashboardRoute(request: Request, env: Env, url: URL): Prom
 
 async function route(request: Request, env: Env, url: URL): Promise<Response> {
   // Who comes before what: a stranger learns nothing, not even which sends exist.
-  const who = await signedInAdmin(request, env);
+  const who = await signedInMember(request, env);
   if (!who.ok) {
     // The identity check's 403 reason names the address; this page shows none.
     return who.status === 403
-      ? messagePage(env, 403, 'Not an admin', 'You are signed in, but not as an admin of this installation. Sign in with another account.')
+      ? messagePage(env, 403, 'Not a member', 'You are signed in, but not as a member of this installation. Sign in with another account.')
       : messagePage(env, who.status, 'Sign-in needed', who.reason);
   }
   if (request.method !== 'GET' && request.method !== 'HEAD') return new Response('GET or HEAD', { status: 405, headers: { Allow: 'GET, HEAD' } });
@@ -87,14 +89,17 @@ async function overview(env: Env, tests: boolean): Promise<Response> {
   const since = iso(new Date(now.getTime() - 30 * 86_400_000));
   // Subscriptions and suppressions are read whole (one row per address); deliveries and events
   // only for the sends shown, through their indexes.
-  const [subs, suppressed, sends, events, approvals, audit] = await Promise.all([
+  const [health, growth, subs, suppressed, sends, events, approvals, audit] = await Promise.all([
+    deliverability(env, now),
+    listGrowth(env, { months: growthMonths }, now),
     // consented_at, not created_at: an import keeps the time each person signed up.
     all<{ list: string; source: string; total: number; recent: number }>(env,
       `SELECT list, source, COUNT(*) AS total, SUM(consented_at >= ?) AS recent FROM subscriptions GROUP BY list, source`, since),
     all<{ scope: string; n: number }>(env, `SELECT scope, COUNT(*) AS n FROM suppressions GROUP BY scope`),
     all<SendRow>(env, `SELECT s.id, s.key, s.list, s.kind, s.created_at, COUNT(d.id) AS recipients, COALESCE(SUM(d.status = 'sent'), 0) AS sent
       FROM (${latestSends}) s LEFT JOIN deliveries d ON d.send_id = s.id GROUP BY s.id ORDER BY s.id DESC`, tests ? 1 : 0, sendsShown),
-    all<{ send_id: number; type: string; n: number }>(env, `SELECT d.send_id, e.type, COUNT(DISTINCT e.delivery_id) AS n
+    // Opens as most tools count them, any open; clicks by people only (src/tracking.ts).
+    all<{ send_id: number; type: string; n: number }>(env, `SELECT d.send_id, e.type, COUNT(DISTINCT CASE WHEN e.type != 'click' OR e.machine = 0 THEN e.delivery_id END) AS n
       FROM deliveries d JOIN events e ON e.delivery_id = d.id WHERE d.send_id IN (SELECT id FROM (${latestSends})) GROUP BY d.send_id, e.type`, tests ? 1 : 0, sendsShown),
     all<PendingRow>(env,
       `SELECT a.id, a.send_key, a.list, a.subject, a.recipients, a.created_at, a.expires_at, a.client_id, ${clientName('a')} AS client_name,
@@ -105,10 +110,10 @@ async function overview(env: Env, tests: boolean): Promise<Response> {
   ]);
 
   const left = new Map(suppressed.map(r => [r.scope, r.n]));
-  const lists = Object.entries(env.CONFIG.lists).map(([id, l]) => {
+  const lists = Object.entries(env.CONFIG.lists).filter(([, l]) => !l.adhoc?.deleted).map(([id, l]) => {
     const mine = subs.filter(r => r.list === id);
     const sources = mine.filter(r => r.recent > 0).sort((a, b) => b.recent - a.recent || a.source.localeCompare(b.source));
-    return `<tr id="list-${escapeHtml(id)}"><th scope="row">${escapeHtml(l.name)}<span class="sub">${escapeHtml(id)}</span></th>`
+    return `<tr id="list-${escapeHtml(id)}"><th scope="row">${escapeHtml(l.name)}<span class="sub">${escapeHtml(id)}${l.adhoc ? ' · made through an assistant' : ''}</span></th>`
       + `<td class="num">${num(sum(mine.map(r => r.total)))}</td><td class="num">${num(left.get(id) ?? 0)}</td><td class="num">${num(sum(mine.map(r => r.recent)))}</td>`
       + `<td>${sources.map(r => `${text(r.source)} ${num(r.recent)}`).join('<br>') || '–'}</td></tr>`;
   });
@@ -134,7 +139,24 @@ async function overview(env: Env, tests: boolean): Promise<Response> {
   const auditRows = audit.map(l => `<tr id="audit-${l.id}"><td>${when(l.at)}</td><td class="wrap">${assistant(l.client_name, l.client_id)}</td>`
     + `<td class="mono">${text(l.tool)}</td><td class="mono">${text(l.scope ?? '')}</td><td>${text(l.outcome)}</td><td class="wrap">${summary(l.summary)}</td></tr>`);
 
-  return shell(env, 'Dashboard', `<h1>How the newsletter does</h1>
+  const level = (l: string) => `<span class="level level-${l}">${{ ok: 'ok', watch: 'watch', act: 'act now' }[l] ?? l}</span>`;
+  const pct = (r: number | null, digits = 1) => r === null ? '–' : `${(100 * r).toFixed(digits)}%`;
+  const healthTiles = [
+    tile('Sent', num(health.sent), `${num(health.delivered)} delivered`),
+    tile('Hard bounces', pct(health.rates.bounce), `${num(health.bounced)} · ${level(health.health.bounce)}`),
+    tile('Complaints', pct(health.rates.complaint, 2), `${num(health.complaints)} · ${level(health.health.complaint)}`),
+    tile('Unsubscribes', num(health.unsubscribed), pct(health.sent ? health.unsubscribed / health.sent : null) + ' of sent'),
+    tile('Failed or unknown', num(health.failed + health.unknown), health.failed + health.unknown ? 'see each send' : 'none'),
+  ];
+  const growthHead = growth.lists.map(l => `<th class="num">${escapeHtml(l.name)}</th>`).join('');
+  const growthRows = growth.lists[0]?.months.map((m, i) => `<tr id="growth-${m.month}"><th scope="row">${m.month}</th>`
+    + growth.lists.map(l => { const g = l.months[i]; return `<td class="num">${g.joined || g.departed ? `+${num(g.joined)} −${num(g.departed)}` : '–'}</td>`; }).join('') + '</tr>') ?? [];
+
+  return shell(env, 'Dashboard', `<h1>How the mail does</h1>
+<h2>Sending health, last ${health.days} days</h2>
+<div class="tiles" id="health">${healthTiles.join('')}</div>
+${health.eventsMissing ? '<p class="note" id="events-missing">Mail went out, but no delivery event came back from SES. Bounces and complaints then do not reach Utskick either: check the SNS topic and its subscription (docs/setup.md, step 2).</p>' : ''}
+<p class="small">Amazon SES reviews an account at ${pct(health.limits.bounce.act, 0)} hard bounces or ${pct(health.limits.complaint.act)} complaints. Gmail reports its own spam rate only in Google Postmaster Tools; keep it under 0.1%.</p>
 <h2>Lists</h2>
 <div class="scroll"><table>
 <thead><tr><th>List</th><th class="num">Subscribers</th><th class="num">Suppressed here</th><th class="num">New, 30 days</th><th>New, by source</th></tr></thead>
@@ -142,8 +164,14 @@ async function overview(env: Env, tests: boolean): Promise<Response> {
 </table></div>
 <p id="suppressed-everywhere">Suppressed on every list (hard bounces, complaints, addresses Mailchimp cleaned): <strong>${num(left.get('*') ?? 0)}</strong></p>
 <p class="small">“Suppressed here” counts those who left the list. “New” counts by the time each person signed up, so an import of old subscribers adds none.</p>
+<h2>Growth, by month</h2>
+${growthRows.length ? `<div class="scroll"><table id="growth">
+<thead><tr><th>Month</th>${growthHead}</tr></thead>
+<tbody>${growthRows.join('\n')}</tbody>
+</table></div>
+<p class="small">Joined and left, by the month each person signed up or left. Before an import, only those still subscribed count.</p>` : '<p>No newsletter lists.</p>'}
 <h2>Sends</h2>
-<p class="small">The latest ${sendsShown}, newest first. Rates are of mails sent. ${tests ? '<a href="/dashboard">Hide test sends</a>' : '<a href="/dashboard?tests=1">Show test sends</a>'}</p>
+<p class="small">The latest ${sendsShown}, newest first. Rates are of mails sent. Clicks are people’s: link scanners are left out. ${tests ? '<a href="/dashboard">Hide test sends</a>' : '<a href="/dashboard?tests=1">Show test sends</a>'}</p>
 ${sendRows.length ? `<div class="scroll"><table>
 <thead><tr><th>Send</th><th>Kind</th><th>Created</th><th class="num">Recipients</th><th class="num">Sent</th><th class="num">Delivered</th><th class="num">Unique opens</th><th class="num">Unique clicks</th><th class="num">Hard bounces</th><th class="num">Complaints</th><th class="num">Unsubscribes</th></tr></thead>
 <tbody>${sendRows.join('\n')}</tbody>
@@ -153,7 +181,7 @@ ${approvalRows.length ? `<div class="scroll"><table>
 <thead><tr><th>Request</th><th>Key</th><th>List</th><th>Subject</th><th class="num">Recipients</th><th>Asked by</th><th>Draft by</th><th>Asked</th><th>Ends</th></tr></thead>
 <tbody>${approvalRows.join('\n')}</tbody>
 </table></div>
-<p class="small">An admin approves a request through the link the assistant got. Utskick keeps only a hash of that link, so it cannot be shown here: ask the assistant for it.</p>` : '<p>No send waits for approval.</p>'}
+<p class="small">An admin approves a request through its link, which went to the admins by mail or to the assistant that asked. Utskick keeps only a hash of that link, so it cannot be shown here.</p>` : '<p>No send waits for approval.</p>'}
 <h2>Audit log</h2>
 ${auditRows.length ? `<div class="scroll"><table id="audit">
 <thead><tr><th>When</th><th>Assistant</th><th>Tool</th><th>Scope</th><th>Outcome</th><th>Summary</th></tr></thead>
@@ -187,7 +215,7 @@ async function sendPage(env: Env, key: string): Promise<Response> {
   const slots = start ? await all<{ type: string; slot: number; n: number }>(env, `SELECT type, CASE WHEN h < ${hourly} THEN h ELSE ${hourly} + (h - ${hourly}) / 24 END AS slot, COUNT(*) AS n FROM (
       SELECT e.type, MAX(0, (CAST(strftime('%s', MIN(e.at)) AS INTEGER) - CAST(strftime('%s', ?2) AS INTEGER)) / 3600) AS h
       FROM deliveries d JOIN events e ON e.delivery_id = d.id
-      WHERE d.send_id = (SELECT id FROM sends WHERE key = ?1) AND e.type IN ('open', 'click') GROUP BY e.delivery_id, e.type
+      WHERE d.send_id = (SELECT id FROM sends WHERE key = ?1) AND e.type IN ('open', 'click') AND e.machine = 0 GROUP BY e.delivery_id, e.type
     ) GROUP BY type, slot`, key, start) : [];
 
   const sent = s.status.sent ?? 0;
@@ -198,15 +226,17 @@ async function sendPage(env: Env, key: string): Promise<Response> {
     tile('Recipients', num(s.recipients)),
     tile('Sent', num(sent), s.recipients ? `${rate(sent, s.recipients)} of recipients` : ''),
     tile('Delivered', num(s.delivered), ofSent(s.delivered)),
-    pixel ? tile('Unique opens', num(s.opens.unique), parts(ofSent(s.opens.unique), `${num(s.opens.total)} in all`)) : tile('Unique opens', 'no pixel', 'This list has no open pixel.'),
-    tile('Unique clicks', num(s.clicks.unique), parts(ofSent(s.clicks.unique), `${num(s.clicks.total)} in all`)),
+    pixel ? tile('Unique opens', num(s.opens.any), parts(ofSent(s.opens.any), s.opens.machine ? `${num(s.opens.machine)} only by machines` : '', `${num(s.opens.total)} by people in all`))
+      : tile('Unique opens', 'no pixel', 'This list has no open pixel.'),
+    tile('Unique clicks', num(s.clicks.unique), parts(ofSent(s.clicks.unique), `${num(s.clicks.total)} in all`, s.clicks.machine ? `${num(s.clicks.machine)} more only by scanners` : '')),
+    pixel ? tile('Click-to-open', rate(s.clicks.unique, s.opens.any), 'of mails opened') : '',
     tile('Hard bounces', num(s.bounced), `${num(s.softBounced)} soft`),
     tile('Complaints', num(s.complaints), ofSent(s.complaints)),
     tile('Unsubscribes', num(s.unsubscribed), ofSent(s.unsubscribed)),
   ];
 
   const most = Math.max(0, ...s.links.map(l => l.unique));
-  const links = s.links.map(l => bar(`link-${l.n}`, `${text(l.url)}<span class="muted"> · ${num(l.total)} in all</span>`, l.unique, most, `${num(l.unique)} · ${rate(l.unique, sent)}`));
+  const links = s.links.map(l => bar(`link-${l.n}`, `${text(l.url)}<span class="muted"> · ${num(l.total)} in all${l.machine ? ` · ${num(l.machine)} more only by scanners` : ''}</span>`, l.unique, most, `${num(l.unique)} · ${rate(l.unique, sent)}`));
   const known = new Set(statuses.map(([name]) => name));
   const status = [...statuses, ...Object.keys(s.status).filter(k => !known.has(k)).map(k => [k, ''] as [string, string])]
     .filter(([name]) => s.status[name])
@@ -220,9 +250,9 @@ async function sendPage(env: Env, key: string): Promise<Response> {
   let overTime = '<p>No mail has gone out yet.</p>';
   if (start) {
     overTime = (pixel
-      ? timeline('opens-over-time', 'First opens', 'when each mail was opened the first time', slots.filter(r => r.type === 'open'), start, now, '#6B7280')
+      ? timeline('opens-over-time', 'First opens', 'when each mail was opened the first time by a person; machines left out', slots.filter(r => r.type === 'open'), start, now, '#6B7280')
       : '<p>This list has no open pixel, so there are no opens to show.</p>')
-      + timeline('clicks-over-time', 'First clicks', 'when each mail was clicked the first time', slots.filter(r => r.type === 'click'), start, now, '#E85D1F');
+      + timeline('clicks-over-time', 'First clicks', 'when each mail was clicked the first time by a person; scanners left out', slots.filter(r => r.type === 'click'), start, now, '#E85D1F');
   }
 
   return shell(env, s.key, `<h1>${escapeHtml(s.key)}</h1>
@@ -231,7 +261,7 @@ async function sendPage(env: Env, key: string): Promise<Response> {
 ${related.map(r => `<p>${r}</p>`).join('\n')}
 <div class="tiles">${tiles.join('')}</div>
 <h2>Clicks per link</h2>
-${links.length ? `<p class="small">Mails with a click on the link, in the order the links come in the mail, and the share of mails sent.</p><div class="bars">${links.join('\n')}</div>` : '<p>This mail has no tracked links.</p>'}
+${links.length ? `<p class="small">Mails with a click on the link by a person, in the order the links come in the mail, and the share of mails sent. Link scanners are left out.</p><div class="bars">${links.join('\n')}</div>` : '<p>This mail has no tracked links.</p>'}
 <h2>Delivery status</h2>
 ${status.length ? `<div class="bars">${status.join('\n')}</div>` : '<p>No recipients.</p>'}
 <h2>Over time</h2>
@@ -291,7 +321,7 @@ ${bars.join('\n')}
 // Pieces
 // --------------------------------------------------------------------------
 
-const opensNote = `<p class="note">Opens overstate reading. Apple Mail Privacy Protection loads every image in a mail, the open pixel too, as soon as the mail arrives, and Gmail fetches images through its own proxy. Many opens are machines, not people. Clicks, and replies to the list's reply-to address, are the honest signal.</p>`;
+const opensNote = `<p class="note">Opens overstate reading. Apple Mail Privacy Protection loads every image in a mail, the open pixel too, as soon as the mail arrives, and Gmail fetches images through its own proxy. Many opens are machines, not people. Utskick marks what it can tell is a machine (Apple's proxy, link scanners at mail servers, clicks before anyone could have read the mail) and counts people's clicks apart, but it cannot tell every case. Clicks, and replies to the list's reply-to address, are the honest signal.</p>`;
 
 // Like audit.ts: anything shaped like an address is blanked, wherever it turns up.
 const address = /[^\s@<>()[\]"',;:]+@[^\s@<>()[\]"',;:]+\.[^\s@<>()[\]"',;:]{2,}/g;
@@ -368,6 +398,9 @@ function shell(env: Env, title: string, body: string): Response {
   .mono { font-size: 13px; }
   .kind { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; border: 1px solid var(--line); padding: 1px 6px; }
   .kind-live { border-color: var(--accent); }
+  .level { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; padding: 1px 6px; border: 1px solid var(--line); }
+  .level-watch { border-color: #B45309; color: #B45309; }
+  .level-act { border-color: #B91C1C; color: #B91C1C; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); border-top: 1px solid var(--line); border-left: 1px solid var(--line); margin-top: 24px; }
   .tile { padding: 14px 16px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); min-width: 0; }
   .label { font-size: 11px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted); }

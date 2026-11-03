@@ -73,7 +73,7 @@ test('an unsubscribed address gets no later issue, and an import cannot bring it
   await handle(oneClick(tokens['bo@example.com']), env);
   const reimport = await handle(admin('/admin/import', { list: 'the-source', source: 'mailchimp-import', consent: 'mailchimp-the-source', contacts: [{ email: 'bo@example.com', consentedAt: '2024-01-01T00:00:00Z' }], suppressions: [] }), env);
   assert.equal((await reimport.json() as Record<string, number>).skipped, 1);
-  const next = await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p>' }), env);
+  const next = await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p><a href="*|UNSUB|*">u</a>' }), env);
   assert.equal((await next.json() as Record<string, number>).recipients, 1);
 });
 

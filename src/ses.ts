@@ -26,11 +26,16 @@ const throttleErrors = ['TooManyRequests', 'Throttling'];
 export class SesError extends Error {
   status: number;
   type: string;  // SES's error type without "Exception", e.g. SendingPaused; '' when it gave none we can read
+  // What SES's text says, read once and dropped: the text itself can name the recipient.
+  //   unverified  "Email address is not verified": the sandbox, or a sender SES does not know.
+  //   quota       "Daily message quota exceeded": nothing more goes out today.
+  reason: '' | 'unverified' | 'quota';
   // The message is the type and status only: SES's own text can name the recipient, and it ends up in the database.
-  constructor(status: number, type: string) {
-    super(`${type || 'HTTP'} ${status}`);
+  constructor(status: number, type: string, reason: SesError['reason'] = '') {
+    super(`${type || 'HTTP'} ${status}${reason ? ` ${reason}` : ''}`);
     this.status = status;
     this.type = type;
+    this.reason = reason;
   }
 
   // The type comes in the x-amzn-ErrorType header or as __type or code in the body,
@@ -40,10 +45,14 @@ export class SesError extends Error {
     try { body = JSON.parse(await res.text()) ?? {}; } catch {}
     const raw = res.headers.get('x-amzn-ErrorType') ?? body.__type ?? body.code;
     const type = typeof raw === 'string' ? raw.split(':')[0].split('#').pop()!.replace(/Exception$/, '') : '';
-    return new SesError(res.status, /^[A-Za-z]{1,64}$/.test(type) ? type : '');
+    const text = String(body.message ?? body.Message ?? '');
+    const reason = /not verified/i.test(text) ? 'unverified' : /daily message quota/i.test(text) ? 'quota' : '';
+    return new SesError(res.status, /^[A-Za-z]{1,64}$/.test(type) ? type : '', reason);
   }
 
   get outcome(): Outcome {
+    // Every other mail would be refused the same way: in the sandbox, from an unknown sender, or past the day's quota.
+    if (this.reason) return 'account';
     if (this.status === 429 || throttleErrors.includes(this.type)) return 'throttled';
     if (this.status >= 500) return 'unsure';
     if (recipientErrors.includes(this.type)) return 'recipient';
