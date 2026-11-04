@@ -141,6 +141,16 @@ curl https://news.example.com/subscribe \
 
 Keep the route's own checks and its own limit per visitor. Utskick's rate limit sees the server's address, not the visitor's, so for a server it caps the server as a whole: 10 sign-ups a minute. Pass the visitor's address in `X-Client-IP` and the limit counts per visitor instead; the form's key vouches for the header, so Utskick reads it only from a form with a key.
 
+A server form can also take someone off one of its lists, as when a reader turns the newsletter off in an app:
+
+```bash
+curl https://news.example.com/unsubscribe \
+  -H "Authorization: Bearer $FORM_KEY" -H 'Content-Type: application/json' \
+  -d '{"email": "reader@example.com", "list": "newsletter"}'
+```
+
+It answers `200 {"ok": true}` whether or not the address was on the list, and the same errors as `/subscribe`. The address is suppressed for that list, so the form cannot sign it up again; the reader joins again by writing to you. Only a form with a key can do this, never a browser form. Utskick has no call that says whether an address is on a list.
+
 ## 3. A Cloudflare Worker or Pages project, over a service binding
 
 Bind the `utskick` Worker as a service (in a Pages project: Settings → Bindings → Service binding) and call the method:

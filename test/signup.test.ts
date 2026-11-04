@@ -275,6 +275,20 @@ test('Sourceful\'s config: the website form posts from its server with a key, fo
   assert.deepEqual((await stored(e)).map(r => [r.email, r.list, r.consent, r.source]), [['reader@example.com', 'the-source', 'the-source-2026-11', 'sourceful-web']]);
 });
 
+test('Sourceful\'s config: the app\'s accounts go to a list of their own, apart from The Source', async () => {
+  const e = env();
+  e.CONFIG = JSON.parse(readFileSync(new URL('../config/sourceful.json', import.meta.url), 'utf8'));
+  const app = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+  e.FORM_KEYS = JSON.stringify({ 'sourceful-web': key, 'sourceful-app': app });
+  const body = { email: 'user@example.com', list: 'app-users', consent: 'app-account-2026-11' };
+  await refused(await handle(post({ ...body, list: 'the-source', consent: 'the-source-2026-11' }, { origin: null, key: app }), e), 400, 'invalid_list');
+  await refused(await handle(post(body, { origin: null, key }), e), 400, 'invalid_list');
+  assert.equal((await handle(post(body, { origin: null, key: app }), e)).status, 200);
+  assert.deepEqual((await stored(e)).map(r => [r.list, r.consent, r.source]), [['app-users', 'app-account-2026-11', 'sourceful-app']]);
+  assert.equal((await handle(unsubscribe({ email: body.email, list: 'app-users' }, { key: app }), e)).status, 200);
+  assert.deepEqual(await stored(e), []);
+});
+
 test('the rate limit counts an IPv6 client per /64 and an IPv4 client per address', async () => {
   const { clientKey } = await import('../src/signup.ts');
   assert.equal(clientKey('203.0.113.7'), '203.0.113.7');
@@ -291,4 +305,44 @@ test('a first name that is not plainly a name is dropped, and the sign-up still 
   }
   const names = await e.DB.prepare('SELECT first_name FROM contacts').all();
   assert.deepEqual(names.results.map((r: Record<string, unknown>) => r.first_name), [null]);
+});
+
+function unsubscribe(body: Record<string, string>, o: Options = {}) {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', 'CF-Connecting-IP': '192.0.2.1' };
+  if (o.origin) headers.Origin = o.origin;
+  if (o.key) headers.Authorization = `Bearer ${o.key}`;
+  return new Request('https://news.test/unsubscribe', { method: o.method ?? 'POST', headers, body: o.method === 'GET' ? undefined : JSON.stringify(body) });
+}
+
+test('a server form takes an address off one of its lists with its key, and cannot sign it up again', async () => {
+  const e = env();
+  const off = { email: 'Reader@Example.com', list: 'the-source' };
+  await handle(post(signup, { origin: null, key }), e);
+  await handle(post({ ...signup, list: 'ftw-news', consent: 'news-2026-10-30' }, { origin: null, key }), e);
+
+  await refused(await handle(unsubscribe(off), e), 401, 'key_required');
+  await refused(await handle(unsubscribe(off, { key: key.slice(0, -1) + 'f' }), e), 401, 'invalid_key');
+  await refused(await handle(unsubscribe(off, { key, origin: 'https://evil.example' }), e), 403, 'origin_not_allowed');
+  await refused(await handle(unsubscribe({ ...off, list: 'ftw-box' }, { key }), e), 400, 'invalid_list');
+  await refused(await handle(unsubscribe({ ...off, email: 'not an address' }, { key }), e), 400, 'invalid_email');
+  assert.equal((await stored(e)).length, 2);
+
+  const res = await handle(unsubscribe(off, { key }), e);
+  assert.equal(res.status, 200);
+  assert.deepEqual(await res.json(), { ok: true });
+  // Off The Source only; still on FTW news.
+  assert.deepEqual((await stored(e)).map(r => r.list), ['ftw-news']);
+  assert.deepEqual(await rows(e, 'SELECT scope, reason FROM suppressions'), [{ scope: 'the-source', reason: 'unsubscribe' }]);
+  // The same form cannot put the address back: someone who left writes in.
+  assert.equal((await handle(post(signup, { origin: null, key }), e)).status, 200);
+  assert.deepEqual((await stored(e)).map(r => r.list), ['ftw-news']);
+  // An address that was never on the list gets the same answer.
+  assert.deepEqual(await (await handle(unsubscribe({ ...off, email: 'stranger@example.com' }, { key }), e)).json(), { ok: true });
+});
+
+test('a GET to /unsubscribe is still the archive\'s page for readers, never the server route', async () => {
+  const e = env();
+  const res = await handle(unsubscribe({}, { method: 'GET', key }), e);
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('Content-Type') ?? '', /text\/html/);
 });
