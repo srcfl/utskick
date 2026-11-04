@@ -2,7 +2,7 @@
 // Origin, a server route by its key. The answer is the same for a new, a known and a suppressed
 // address, so the form reveals nothing, and a refused request stores nothing.
 import { isList, type Config, type FormConfig } from './config.ts';
-import { firstName, subscribe, type Signup } from './contacts.ts';
+import { firstName, forget, subscribe, type Signup } from './contacts.ts';
 import type { Env } from './env.ts';
 import { HttpError, json, normalizeEmail, sameSecret } from './util.ts';
 
@@ -41,6 +41,37 @@ export async function signupRoute(request: Request, env: Env): Promise<Response>
   } catch (error) {
     if (!(error instanceof HttpError)) throw error;
     return reply(form, origin, thanks, error);
+  }
+}
+
+// POST /unsubscribe: a server form takes an address off one of its lists, as when a reader turns the
+// newsletter off in an app. Only with the form's key: in a browser, anyone could take anyone off.
+// The address is suppressed for that list, so the form cannot sign it up again. The answer is the
+// same whether or not it was on the list.
+export async function unsubscribeRoute(request: Request, env: Env): Promise<Response> {
+  if (request.method !== 'POST') {
+    const res = json({ error: 'method_not_allowed' }, 405);
+    res.headers.set('Allow', 'POST');
+    return res;
+  }
+  try {
+    const auth = request.headers.get('Authorization');
+    if (auth === null) throw new HttpError(401, 'key_required');
+    const form = await formByKey(env, env.CONFIG.forms ?? {}, auth);
+    if (!form) throw new HttpError(401, 'invalid_key');
+    const origin = request.headers.get('Origin');
+    if (origin !== null && !form.config.origins?.includes(origin)) throw new HttpError(403, 'origin_not_allowed');
+    const fields = await readFields(request);
+    const client = clientKey(request.headers.get('X-Client-IP') || request.headers.get('CF-Connecting-IP') || 'unknown');
+    if (!await signupAllowed(env, `${form.name}:${client}`)) throw new HttpError(429, 'rate_limited');
+    const email = normalizeEmail(fields.email);
+    if (!email) throw new HttpError(400, 'invalid_email');
+    if (typeof fields.list !== 'string' || !form.config.lists.includes(fields.list) || !isList(env.CONFIG, fields.list)) throw new HttpError(400, 'invalid_list');
+    await forget(env, email, fields.list, 'unsubscribe');
+    return json({ ok: true });
+  } catch (error) {
+    if (!(error instanceof HttpError)) throw error;
+    return json({ error: error.message }, error.status);
   }
 }
 

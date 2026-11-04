@@ -36,6 +36,14 @@
       "replyTo": "support@sourceful.energy",
       "opens": false,
       "fname": "there"
+    },
+    "app-users": {
+      "name": "Sourceful app users",
+      "from": "Sourceful Energy <the-source@news.sourceful.energy>",
+      "replyTo": "info@sourceful.energy",
+      "opens": false,
+      "fname": "there",
+      "consent": "app-account-2026-11"
     }
   },
   "admins": [
@@ -69,6 +77,12 @@
       "origins": [
         "https://sourceful.energy",
         "https://www.sourceful.energy"
+      ],
+      "key": true
+    },
+    "sourceful-app": {
+      "lists": [
+        "app-users"
       ],
       "key": true
     }

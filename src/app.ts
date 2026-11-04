@@ -12,7 +12,7 @@ import { archiveUnsubscribePage, confirmPage, donePage, notFound, testDonePage }
 import { render } from './render.ts';
 import { createSend, retryFailed, retryUnknown, runBatch, stats } from './send.ts';
 import { isSnsUrl, regionOf, verifySns, type SnsMessage } from './sns.ts';
-import { boundedText, signupRoute } from './signup.ts';
+import { boundedText, signupRoute, unsubscribeRoute } from './signup.ts';
 import { burstLinks, burstMs, machineClick, machineOpen } from './tracking.ts';
 import { withLists } from './lists.ts';
 import { HttpError, iso, json, normalizeEmail, sameSecret, sha256 } from './util.ts';
@@ -43,6 +43,8 @@ export async function handle(request: Request, env: Env): Promise<Response> {
       if (res) return res;
     }
     if (url.pathname === '/subscribe') return await signupRoute(request, env);
+    // GET /unsubscribe is the archive's page for readers; a POST is a server form taking someone off.
+    if (url.pathname === '/unsubscribe' && request.method === 'POST') return await unsubscribeRoute(request, env);
     const approval = url.pathname.match(/^\/approve\/([A-Za-z0-9_-]{43})$/);
     if (approval) return await approvalRoute(request, env, approval[1]);
     if (url.pathname === '/dashboard' || url.pathname.startsWith('/dashboard/')) return await dashboardRoute(request, env, url);

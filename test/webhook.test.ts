@@ -31,15 +31,17 @@ function sesEvent(event: Record<string, unknown>) {
 
 test('a permanent bounce suppresses the address on every list', async () => {
   const env = await sentTo(['ok@example.com', 'bounce@example.com']);
+  // A batch sends in parallel, so which recipient got msg-2 varies.
+  const [{ message_id: id }] = await rows(env, `SELECT d.message_id FROM deliveries d JOIN contacts c ON c.id = d.contact_id WHERE c.email = 'bounce@example.com'`);
   const res = await handle(post(sesEvent({
     eventType: 'Bounce',
-    mail: { messageId: 'msg-2', destination: ['bounce@example.com'] },
+    mail: { messageId: id, destination: ['bounce@example.com'] },
     bounce: { bounceType: 'Permanent', bouncedRecipients: [{ emailAddress: 'bounce@example.com' }] },
   })), env);
   assert.equal(res.status, 200);
   assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: '*', reason: 'bounce' }]);
   assert.deepEqual(await rows(env, `SELECT email FROM contacts ORDER BY email`), [{ email: 'ok@example.com' }]);
-  assert.deepEqual(await rows(env, `SELECT e.type, d.message_id FROM events e JOIN deliveries d ON d.id = e.delivery_id`), [{ type: 'bounce', message_id: 'msg-2' }]);
+  assert.deepEqual(await rows(env, `SELECT e.type, d.message_id FROM events e JOIN deliveries d ON d.id = e.delivery_id`), [{ type: 'bounce', message_id: id }]);
   const next = await handle(admin('/admin/sends', { key: 'the-source-23', list: 'the-source', kind: 'live', subject: 'S', html: '<p>x</p><a href="*|UNSUB|*">u</a>' }), env);
   assert.equal((await next.json() as Record<string, number>).recipients, 1);
 });
