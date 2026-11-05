@@ -31,6 +31,8 @@ export default defineConfig(async ({ mode }) => {
 				// POST /subscribe: 10 sign-ups a minute per form and client address (src/signup.ts).
 				// The namespace is any number no other rate limiter in the account uses.
 				SIGNUP_LIMITER: bindings.rateLimit({ namespace: deploy.signupLimiterNamespace, simple: { limit: 10, period: 60 } }),
+				// POST /subscribe/status: 120 lookups a minute per calling server (src/status.ts).
+				STATUS_LIMITER: bindings.rateLimit({ namespace: deploy.statusLimiterNamespace, simple: { limit: 120, period: 60 } }),
 				PUBLIC_URL: bindings.text(dev ? "http://localhost:5173" : deploy.publicUrl),
 				AWS_REGION: bindings.text(deploy.awsRegion),
 				// In development, every sign-in at /oauth/authorize, /approve/ and /dashboard is the first admin,
@@ -43,6 +45,8 @@ export default defineConfig(async ({ mode }) => {
 				SNS_TOPIC_ARN: bindings.secret(),
 				// JSON {"<form>": "<key>"} for the forms in the config that need a key; {} when none do (docs/signup.md).
 				FORM_KEYS: bindings.secret(),
+				// Bearer token for POST /subscribe/status. Distinct from every form key (docs/signup.md).
+				STATUS_KEY: bindings.secret(),
 			},
 		},
 	};

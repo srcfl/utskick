@@ -146,3 +146,16 @@ export async function subscribe(env: Env, s: Signup, now = new Date()): Promise<
   ]);
   return { ok: true };
 }
+
+// True when the address is on the list now. Someone who left, bounced, or was never on it is not.
+// Looked up by hash, so a status check does not put the address in the query.
+export async function subscribed(env: Env, email: string, list: string): Promise<boolean> {
+  const hash = await sha256(email);
+  const row = await env.DB.prepare(
+    `SELECT EXISTS (
+       SELECT 1 FROM subscriptions s JOIN contacts c ON c.id = s.contact_id
+       WHERE c.email_hash = ?1 AND s.list = ?2
+     ) AS found`
+  ).bind(hash, list).first<{ found: number }>();
+  return Number(row?.found) === 1;
+}

@@ -41,6 +41,12 @@ export interface Config {
   access?: AccessConfig;
   // Website forms that may post to /subscribe. None when empty.
   forms?: Record<string, FormConfig>;
+  // Lists POST /subscribe/status may query with STATUS_KEY. Off when absent or empty.
+  status?: StatusConfig;
+}
+
+export interface StatusConfig {
+  lists: string[];       // the lists the STATUS_KEY may ask about, e.g. ["app-users"]
 }
 
 export interface AdhocConfig {

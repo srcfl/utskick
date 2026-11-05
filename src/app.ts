@@ -1,4 +1,5 @@
-// Every HTTP route. Public: unsubscribe, click, open, archive, images, the SES webhook, sign-up forms. /admin is for the CLI.
+// Every HTTP route. Public: unsubscribe, click, open, archive, images, the SES webhook, sign-up forms.
+// POST /subscribe/status is the web-app's server-to-server lookup (STATUS_KEY, never a form key). /admin is for the CLI.
 // Assistants: /mcp with a bearer token, OAuth under /oauth and /.well-known, and /approve/ for an admin (docs/mcp.md).
 // /dashboard: read-only numbers for a signed-in admin (docs/dashboard.md).
 import { approvalRoute } from './approvals.ts';
@@ -13,6 +14,7 @@ import { render } from './render.ts';
 import { createSend, retryFailed, retryUnknown, runBatch, stats } from './send.ts';
 import { isSnsUrl, regionOf, verifySns, type SnsMessage } from './sns.ts';
 import { boundedText, signupRoute, unsubscribeRoute } from './signup.ts';
+import { statusRoute } from './status.ts';
 import { burstLinks, burstMs, machineClick, machineOpen } from './tracking.ts';
 import { withLists } from './lists.ts';
 import { HttpError, iso, json, normalizeEmail, sameSecret, sha256 } from './util.ts';
@@ -43,6 +45,8 @@ export async function handle(request: Request, env: Env): Promise<Response> {
       if (res) return res;
     }
     if (url.pathname === '/subscribe') return await signupRoute(request, env);
+    // A server with STATUS_KEY, never a form key: is this one address on this list?
+    if (url.pathname === '/subscribe/status') return await statusRoute(request, env);
     // GET /unsubscribe is the archive's page for readers; a POST is a server form taking someone off.
     if (url.pathname === '/unsubscribe' && request.method === 'POST') return await unsubscribeRoute(request, env);
     const approval = url.pathname.match(/^\/approve\/([A-Za-z0-9_-]{43})$/);

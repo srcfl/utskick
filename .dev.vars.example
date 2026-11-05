@@ -5,3 +5,5 @@ AWS_SECRET_ACCESS_KEY=local
 SNS_TOPIC_ARN=arn:aws:sns:eu-central-1:000000000000:utskick-events
 # {"<form>":"<key of 32+ characters>"} to try a server form locally (docs/signup.md)
 FORM_KEYS={}
+# Bearer token for POST /subscribe/status. Distinct from every form key. Fake local value only.
+STATUS_KEY=local-status-key-not-for-production-use

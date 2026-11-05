@@ -9,7 +9,8 @@
       "id": "e43b0294-fce6-4010-bb4c-08a2fd99a96c"
     },
     "r2": "utskick-images",
-    "signupLimiterNamespace": "7001"
+    "signupLimiterNamespace": "7001",
+    "statusLimiterNamespace": "7002"
   },
   "organization": "Sourceful Energy",
   "homepage": "https://sourceful.energy",
@@ -86,5 +87,10 @@
       ],
       "key": true
     }
+  },
+  "status": {
+    "lists": [
+      "app-users"
+    ]
   }
 }

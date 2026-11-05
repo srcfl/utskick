@@ -9,7 +9,8 @@
       "id": "00000000-0000-0000-0000-000000000000"
     },
     "r2": "utskick-images",
-    "signupLimiterNamespace": "1001"
+    "signupLimiterNamespace": "1001",
+    "statusLimiterNamespace": "1002"
   },
   "organization": "Example Co",
   "homepage": "https://example.com",
@@ -70,5 +71,10 @@
       ],
       "key": true
     }
+  },
+  "status": {
+    "lists": [
+      "newsletter"
+    ]
   }
 }
