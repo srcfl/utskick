@@ -7,6 +7,7 @@ Utskick takes sign-ups from your own websites in three ways. All of them end in 
 | A Cloudflare Worker or Pages project | Service binding: it calls `subscribe()` over RPC | The binding itself; the method cannot be reached from the internet |
 | Any server (a Next.js route, a backend) | `POST /subscribe` with the form's key | `Authorization: Bearer <key>` |
 | A page with no server of its own | `POST /subscribe` from the browser | The page's `Origin`, over CORS |
+| Your own account page (server only) | `POST /subscribe/status` with `STATUS_KEY` | `Authorization: Bearer <STATUS_KEY>` — never a form key |
 
 Pick the first that fits. A browser form is the weakest: browsers send a true `Origin`, which stops other websites from posting through their visitors, but a script can send any `Origin` it likes. For a browser form, the rate limit, the hidden bot field and the consent check do the real work.
 
@@ -149,7 +150,7 @@ curl https://news.example.com/unsubscribe \
   -d '{"email": "reader@example.com", "list": "newsletter"}'
 ```
 
-It answers `200 {"ok": true}` whether or not the address was on the list, and the same errors as `/subscribe`. The address is suppressed for that list, so the form cannot sign it up again; the reader joins again by writing to you. Only a form with a key can do this, never a browser form. Utskick has no call that says whether an address is on a list.
+It answers `200 {"ok": true}` whether or not the address was on the list, and the same errors as `/subscribe`. The address is suppressed for that list, so the form cannot sign it up again; the reader joins again by writing to you. Only a form with a key can do this, never a browser form. Whether someone is on a list is a separate call, `POST /subscribe/status`, with its own secret.
 
 ## 3. A Cloudflare Worker or Pages project, over a service binding
 
@@ -162,10 +163,60 @@ await env.UTSKICK.subscribe({ email, list: 'newsletter', consent: 'newsletter-20
 
 The call never leaves Cloudflare, so there is no Origin or key on Utskick's side: the calling site checks those before it calls. The rate limit holds, though, since the site's own form is open to anyone: 10 sign-ups a minute per visitor when the site passes the visitor's address as `ip`, and 10 a minute for the whole site when it does not. It throws `rate_limited`, `invalid_list`, `invalid_email` or `invalid_consent`, and returns `{ ok: true }` otherwise. Bind it in production only, or a preview deployment signs people up for real. [examples/ftw-web.md](examples/ftw-web.md) is a Pages site that does this.
 
+## 4. Is this person on a list? `POST /subscribe/status`
+
+A signed-in account page may need to know whether *that person* is on a list, for example `app-users`. That is personal data: the call exists only for a server you control, authenticated with a secret that never goes to a browser, an app binary, or a form.
+
+**Never use a form key here.** Form keys are for `POST /subscribe` and `POST /unsubscribe`. They are held by websites and apps, so treat them as public. A leaked form key that answered "is this address on the list?" would let anyone check who subscribes. Utskick refuses a form key on this path with `401 {"error": "form_key_not_allowed"}`, even if you accidentally set `STATUS_KEY` to the same value.
+
+The caller is responsible for passing only the signed-in person's own address, one per request.
+
+```bash
+curl https://news.example.com/subscribe/status \
+  -H "Authorization: Bearer $STATUS_KEY" -H 'Content-Type: application/json' \
+  -d '{"email": "reader@example.com", "list": "newsletter"}'
+```
+
+`STATUS_KEY` is a Worker secret. Generate it with `openssl rand -hex 32` and store it in Bitwarden under that name, next to `ADMIN_TOKEN` and `FORM_KEYS`. It must be at least 32 characters and a different value from every form key. On the calling server (for Sourceful: the Vercel web-app), keep the same value under a name that cannot be confused with a form key, for example `UTSKICK_STATUS_KEY`. Do not put it in `FORM_KEYS`.
+
+The body is `application/json` only, at most 2 KB, one object:
+
+| Field | | |
+|---|---|---|
+| `email` | required | The address. Case and spaces at the ends do not matter. One address only: an `emails` array is ignored, and `email` as an array is refused. |
+| `list` | required | A list id from `status.lists` in the config. |
+
+Answers:
+
+- `200 {"subscribed": true}` or `200 {"subscribed": false}`. Nothing else: no address, name, consent, source or suppression reason. `false` covers never signed up, left, and bounced. `Cache-Control: no-store`.
+- No CORS. This is server-to-server; a browser must not call it.
+
+| Status | `error` | Why |
+|---|---|---|
+| 400 | `invalid_email`, `invalid_list`, `invalid_body` | That field is wrong, or `list` is not in `status.lists`. |
+| 401 | `key_required`, `invalid_key`, `form_key_not_allowed` | No key, not `STATUS_KEY`, or a form key. |
+| 405 | `method_not_allowed` | Only `POST`. A GET would put the address in the URL, which logs keep. |
+| 413 | `too_large` | The body is over 2 KB. |
+| 415 | `unsupported_media_type` | Not JSON. |
+| 429 | `rate_limited` | Too many lookups from this client; `Retry-After` says when to try again. |
+| 503 | `status_unavailable` | `STATUS_KEY` is missing or too short, or `status.lists` is empty. |
+
+Config: name the lists this secret may query. With no `status` block, or an empty list, the endpoint is off.
+
+```json
+{
+  "status": { "lists": ["newsletter"] }
+}
+```
+
+Sourceful's web-app asks about `app-users` only.
+
+Logs: `{ event: "subscription_status", list, subscribed }` on a 200, and `{ event: "form_key_rejected", path: "/subscribe/status" }` when a form key is presented. No address, no key.
+
 ## Abuse limits
 
 - **Size.** At most 2 KB; Utskick stops reading past that.
-- **Rate.** 10 sign-ups a minute per form and client address (`CF-Connecting-IP`, or `X-Client-IP` from a form with a key; `ip` over a service binding), with the Workers Rate Limiting binding `SIGNUP_LIMITER` in `cloudflare.config.ts`. That binding counts per Cloudflare location and is meant to be cheap rather than exact, so a few more can get through. Without the binding, as in the tests, a counter in memory takes its place. Requests refused for their origin, key, size, type, body or redirect do not count; everything after those checks does, valid or not.
+- **Rate.** 10 sign-ups a minute per form and client address (`CF-Connecting-IP`, or `X-Client-IP` from a form with a key; `ip` over a service binding), with the Workers Rate Limiting binding `SIGNUP_LIMITER` in `cloudflare.config.ts`. That binding counts per Cloudflare location and is meant to be cheap rather than exact, so a few more can get through. Without the binding, as in the tests, a counter in memory takes its place. Requests refused for their origin, key, size, type, body or redirect do not count; everything after those checks does, valid or not. `POST /subscribe/status` has its own limiter, `STATUS_LIMITER`: 120 lookups a minute per calling server (`CF-Connecting-IP` only; `X-Client-IP` is ignored, so a stolen `STATUS_KEY` cannot mint a new budget per guessed address).
 - **Bots.** The hidden `website` field: a bot that fills it gets the usual answer and nothing is stored.
 - **Consent.** Only the list's current consent id is accepted.
 - **No redirect elsewhere.** `redirect` must be on the form's own origins, compared as parsed URLs, so `https://example.com.evil.example/` and `javascript:` are refused.

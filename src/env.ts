@@ -13,6 +13,8 @@ export interface Env {
   SES_CONFIGURATION_SET: string;  // publishes bounces, complaints and deliveries to SNS
   SNS_TOPIC_ARN: string;          // the only topic /hooks/ses accepts
   FORM_KEYS?: string;             // JSON {"<form>": "<key>"} for the forms with key: true (docs/signup.md)
+  STATUS_KEY?: string;            // bearer token for POST /subscribe/status; never a form key (docs/signup.md)
   SIGNUP_LIMITER?: RateLimit;     // Workers Rate Limiting for /subscribe; without it (tests) a counter in memory
+  STATUS_LIMITER?: RateLimit;     // Workers Rate Limiting for /subscribe/status; without it (tests) a counter in memory
   DEV_IDENTITY?: string;          // only under `cf dev` and in tests: the admin every sign-in is (src/identity.ts)
 }

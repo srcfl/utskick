@@ -11,7 +11,7 @@ We answer within five working days, tell you what we will do, and credit you in 
 
 ## In scope
 
-The Worker (`src/`), the CLI (`cli/`), the database schema (`migrations/`) and the documented setup (`docs/setup.md`). Examples are: sending to someone who unsubscribed or never signed up, reading or changing subscribers without the admin token or an OAuth grant, sending to a list without a human approval, forging SES/SNS events, reading personal data from public pages, and anything that runs code in a reader's or an admin's browser.
+The Worker (`src/`), the CLI (`cli/`), the database schema (`migrations/`) and the documented setup (`docs/setup.md`). Examples are: sending to someone who unsubscribed or never signed up, reading or changing subscribers without the admin token or an OAuth grant, learning whether an address is on a list without `STATUS_KEY` (including with a form key), sending to a list without a human approval, forging SES/SNS events, reading personal data from public pages, and anything that runs code in a reader's or an admin's browser.
 
 The security model is described in [README.md](README.md#security-model), [docs/mcp.md](docs/mcp.md), [docs/dashboard.md](docs/dashboard.md) and [docs/signup.md](docs/signup.md).
 

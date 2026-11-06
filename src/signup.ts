@@ -103,6 +103,17 @@ async function whichForm(request: Request, env: Env, forms: Record<string, FormC
   throw new HttpError(403, 'origin_not_allowed');
 }
 
+// True when Authorization is a form's key. /subscribe/status uses this so a form key, which a
+// browser or an app can hold, cannot be used to find out who is on a list.
+export async function isFormKey(env: Env, auth: string): Promise<boolean> {
+  try {
+    return (await formByKey(env, env.CONFIG.forms ?? {}, auth)) !== null;
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 503) return false;
+    throw error;
+  }
+}
+
 // Compares the key with every form's, so the time taken does not say which one matched.
 async function formByKey(env: Env, forms: Record<string, FormConfig>, auth: string): Promise<Form | null> {
   const keys = formKeys(env);

@@ -105,20 +105,21 @@ cf d1 create --name utskick-db --jurisdiction eu
 cf r2 buckets create --name utskick-images --cf-r2-jurisdiction eu
 ```
 
-Copy `config/example.json` to `config/<you>.json` and fill in its `deploy` section: `publicUrl` (`https://$DOMAIN`; the deploy attaches that hostname to the Worker), `awsRegion`, `sesConfigurationSet`, the D1 name and id, the R2 bucket, and `signupLimiterNamespace` (any number no other rate limiter in the account uses). Fill in the rest too: organization, lists (with a `consent` id for lists that take form sign-ups), `forms`, `members` (who may use the dashboard and connect an assistant: addresses, or `"@example.com"` for everyone at a domain), `admins` (members who may also approve a send to a list) and `testAllowlist` (addresses besides the signed-in person's own that an assistant's test send may reach). Then:
+Copy `config/example.json` to `config/<you>.json` and fill in its `deploy` section: `publicUrl` (`https://$DOMAIN`; the deploy attaches that hostname to the Worker), `awsRegion`, `sesConfigurationSet`, the D1 name and id, the R2 bucket, `signupLimiterNamespace` and `statusLimiterNamespace` (any numbers no other rate limiter in the account uses). Fill in the rest too: organization, lists (with a `consent` id for lists that take form sign-ups), `forms`, `status.lists` (lists `POST /subscribe/status` may query; omit the block to leave that call off), `members` (who may use the dashboard and connect an assistant: addresses, or `"@example.com"` for everyone at a domain), `admins` (members who may also approve a send to a list) and `testAllowlist` (addresses besides the signed-in person's own that an assistant's test send may reach). Then:
 
 ```bash
 cf d1 migrations apply <d1-id>
 openssl rand -hex 32   # the admin token: into the secrets file, and into .env as MAILER_ADMIN_TOKEN
+openssl rand -hex 32   # STATUS_KEY: into the secrets file and Bitwarden; never a form key (docs/signup.md)
 ```
 
 Secrets file (`.secrets.json`, git-ignored, deleted after use):
 
 ```json
-{ "ADMIN_TOKEN": "…", "AWS_ACCESS_KEY_ID": "…", "AWS_SECRET_ACCESS_KEY": "…", "SNS_TOPIC_ARN": "arn:aws:sns:<region>:<account>:utskick-events", "FORM_KEYS": "{}" }
+{ "ADMIN_TOKEN": "…", "AWS_ACCESS_KEY_ID": "…", "AWS_SECRET_ACCESS_KEY": "…", "SNS_TOPIC_ARN": "arn:aws:sns:<region>:<account>:utskick-events", "FORM_KEYS": "{}", "STATUS_KEY": "…" }
 ```
 
-`FORM_KEYS` holds the keys of website forms that post from a server; `{}` until you have one ([signup.md](signup.md)).
+`FORM_KEYS` holds the keys of website forms that post from a server; `{}` until you have one ([signup.md](signup.md)). `STATUS_KEY` is a separate secret for `POST /subscribe/status` (whether the signed-in person is on a list). Generate it with `openssl rand -hex 32` and store it in Bitwarden as `STATUS_KEY`; it must not be a form key. Without `status.lists` in the config the call stays off.
 
 ```bash
 UTSKICK_CONFIG=config/<you>.json cf deploy --secrets-file .secrets.json && rm .secrets.json
