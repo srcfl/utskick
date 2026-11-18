@@ -137,7 +137,14 @@ export async function subscribe(env: Env, s: Signup, now = new Date()): Promise<
   // One batch whatever the address, with the suppression checked in each insert: a suppressed
   // address takes as long as a new one, so the time of the answer tells nothing either.
   const free = `NOT EXISTS (SELECT 1 FROM suppressions WHERE email_hash = ?2 AND scope IN (?3, '*'))`;
+  // The Sourceful app has already signed the owner in, so they may turn this list back on
+  // after leaving. Website forms must not: they cannot tell the person from someone typing
+  // their address. Bounce, complaint, and Mailchimp-cleaned stays in force.
+  const statements = source === 'sourceful-app'
+    ? [env.DB.prepare(`DELETE FROM suppressions WHERE email_hash = ?1 AND scope = ?2 AND reason = 'unsubscribe'`).bind(hash, list)]
+    : [];
   await env.DB.batch([
+    ...statements,
     joinedStatement(env.DB, list, email, hash, iso(now).slice(0, 10)),
     env.DB.prepare(`INSERT INTO contacts (email, email_hash, first_name, country) SELECT ?1, ?2, ?4, ?5 WHERE ${free} ON CONFLICT DO NOTHING`)
       .bind(email, hash, list, firstName(s.firstName), country),
