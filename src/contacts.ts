@@ -120,11 +120,11 @@ export function firstName(name: unknown): string | null {
   return n.length <= 40 && /^\p{L}[\p{L}\p{M} '’-]*$/u.test(n) ? n : null;
 }
 
-// A sign-up someone made on a form. Until sign-ups are confirmed by mail (double opt-in), anyone can
-// type anyone's address, so a sign-up only adds: it never lifts a suppression (someone who left and
-// wants back writes to support), never changes a known contact, and never rewrites the consent of an
-// existing subscription. A name that is not a name is dropped. The answer is the same in every case,
-// so the form does not reveal who is on a list.
+// A sign-up someone made on a form. A new sign-up for a list lifts a list-scoped unsubscribe for
+// that list, so someone who left can join again. It never lifts a bounce, complaint, or
+// Mailchimp-cleaned suppression, never changes a known contact, and never rewrites the consent of
+// an existing subscription. A name that is not a name is dropped. The answer is the same in every
+// case, so the form does not reveal who is on a list.
 export async function subscribe(env: Env, s: Signup, now = new Date()): Promise<{ ok: true }> {
   const { list } = s;
   if (!isList(env.CONFIG, list)) throw new Error('invalid_list');
@@ -138,6 +138,8 @@ export async function subscribe(env: Env, s: Signup, now = new Date()): Promise<
   // address takes as long as a new one, so the time of the answer tells nothing either.
   const free = `NOT EXISTS (SELECT 1 FROM suppressions WHERE email_hash = ?2 AND scope IN (?3, '*'))`;
   await env.DB.batch([
+    // Only a list-scoped unsubscribe for this list; bounce, complaint, and Mailchimp-cleaned stay.
+    env.DB.prepare(`DELETE FROM suppressions WHERE email_hash = ?1 AND scope = ?2 AND reason = 'unsubscribe'`).bind(hash, list),
     joinedStatement(env.DB, list, email, hash, iso(now).slice(0, 10)),
     env.DB.prepare(`INSERT INTO contacts (email, email_hash, first_name, country) SELECT ?1, ?2, ?4, ?5 WHERE ${free} ON CONFLICT DO NOTHING`)
       .bind(email, hash, list, firstName(s.firstName), country),

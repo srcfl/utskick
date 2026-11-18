@@ -19,32 +19,38 @@ test('a form sign-up lands on its list with its consent, time and source', async
   ]);
 });
 
-// Until sign-ups are confirmed by mail (double opt-in), a form cannot tell the person from someone
-// who typed their address, so it may not undo what the person chose. Someone who left and wants back
-// writes to support. This replaces the earlier rule that a new sign-up lifted "left this list".
-test('signing up again after leaving does not lift the suppression', async () => {
+// A new sign-up for a list puts back someone who left that list. It does not lift an unsubscribe
+// on a different list, and the answer stays the same so the form reveals nothing.
+test('signing up again after leaving puts the address back on that list', async () => {
   const env = testEnv();
   await subscribe(env, signup);
   const { hash } = (await rows<{ hash: string }>(env, 'SELECT email_hash AS hash FROM contacts'))[0];
   await env.DB.prepare(`INSERT INTO suppressions (email_hash, scope, reason) VALUES (?, 'ftw-news', 'unsubscribe')`).bind(hash).run();
   await env.DB.prepare('DELETE FROM subscriptions').run();
   assert.deepEqual(await subscribe(env, signup), { ok: true }, 'the same answer, so the form reveals nothing');
-  assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: 'ftw-news', reason: 'unsubscribe' }]);
-  assert.equal((await rows(env, 'SELECT COUNT(*) AS n FROM subscriptions')).at(0)!.n, 0);
-  // Leaving one list does not stop a sign-up for another.
+  assert.deepEqual(await rows(env, 'SELECT list, source FROM subscriptions'), [{ list: 'ftw-news', source: 'ftw-web' }]);
+  assert.deepEqual(await rows(env, 'SELECT * FROM suppressions'), []);
+  // Leaving one list does not stop a sign-up for another, and does not lift the other list's unsubscribe.
+  await env.DB.prepare('DELETE FROM subscriptions').run();
+  await env.DB.prepare(`INSERT INTO suppressions (email_hash, scope, reason) VALUES (?, 'ftw-news', 'unsubscribe')`).bind(hash).run();
   await subscribe(env, { ...signup, list: 'ftw-box', consent: 'gateway-2026-10-30' });
   assert.deepEqual(await rows(env, 'SELECT list FROM subscriptions'), [{ list: 'ftw-box' }]);
+  assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: 'ftw-news', reason: 'unsubscribe' }]);
 });
 
-test('a bounced or complaining address is not signed up again', async () => {
+test('a bounced, complaining or Mailchimp-cleaned address is not signed up again', async () => {
   const env = testEnv();
   await subscribe(env, signup);
   const { hash } = (await rows<{ hash: string }>(env, 'SELECT email_hash AS hash FROM contacts'))[0];
   await env.DB.prepare('DELETE FROM contacts').run();
   await env.DB.prepare('DELETE FROM subscriptions').run();
-  await env.DB.prepare(`INSERT INTO suppressions (email_hash, scope, reason) VALUES (?, '*', 'complaint')`).bind(hash).run();
-  assert.deepEqual(await subscribe(env, signup), { ok: true }, 'the same answer, so the form reveals nothing');
-  assert.deepEqual(await rows(env, 'SELECT * FROM subscriptions'), []);
+  for (const reason of ['complaint', 'bounce', 'mailchimp-cleaned']) {
+    await env.DB.prepare('DELETE FROM suppressions').run();
+    await env.DB.prepare(`INSERT INTO suppressions (email_hash, scope, reason) VALUES (?, '*', ?)`).bind(hash, reason).run();
+    assert.deepEqual(await subscribe(env, signup), { ok: true }, 'the same answer, so the form reveals nothing');
+    assert.deepEqual(await rows(env, 'SELECT * FROM subscriptions'), [], reason);
+    assert.deepEqual(await rows(env, 'SELECT scope, reason FROM suppressions'), [{ scope: '*', reason }]);
+  }
 });
 
 test('an unknown list or a bad address is refused', async () => {
