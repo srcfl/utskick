@@ -287,6 +287,9 @@ test('Sourceful\'s config: the app\'s accounts go to a list of their own, apart 
   assert.deepEqual((await stored(e)).map(r => [r.list, r.consent, r.source]), [['app-users', 'app-account-2026-11', 'sourceful-app']]);
   assert.equal((await handle(unsubscribe({ email: body.email, list: 'app-users' }, { key: app }), e)).status, 200);
   assert.deepEqual(await stored(e), []);
+  // The app has signed the user in, so they may opt in again after leaving.
+  assert.equal((await handle(post(body, { origin: null, key: app }), e)).status, 200);
+  assert.deepEqual((await stored(e)).map(r => [r.list, r.source]), [['app-users', 'sourceful-app']]);
 });
 
 test('the rate limit counts an IPv6 client per /64 and an IPv4 client per address', async () => {
