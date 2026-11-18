@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { handle } from '../src/app.ts';
-import { firstName, forget, subscribe } from '../src/contacts.ts';
+import { firstName, subscribe } from '../src/contacts.ts';
 import { normalizeEmail } from '../src/util.ts';
 import { admin, rows, testEnv } from './helpers.ts';
 
@@ -34,23 +34,6 @@ test('signing up again after leaving does not lift the suppression', async () =>
   // Leaving one list does not stop a sign-up for another.
   await subscribe(env, { ...signup, list: 'ftw-box', consent: 'gateway-2026-10-30' });
   assert.deepEqual(await rows(env, 'SELECT list FROM subscriptions'), [{ list: 'ftw-box' }]);
-});
-
-test('the Sourceful app can sign the same user up again after they left that list', async () => {
-  const env = testEnv();
-  const appSignup = { ...signup, source: 'sourceful-app' };
-  await subscribe(env, appSignup);
-  await forget(env, appSignup.email, 'ftw-news', 'unsubscribe');
-  assert.equal((await rows(env, 'SELECT COUNT(*) AS n FROM subscriptions')).at(0)!.n, 0);
-  assert.deepEqual(await subscribe(env, appSignup), { ok: true });
-  assert.deepEqual(await rows(env, 'SELECT list, source FROM subscriptions'), [{ list: 'ftw-news', source: 'sourceful-app' }]);
-  assert.deepEqual(await rows(env, 'SELECT * FROM suppressions'), []);
-  // Bounce and complaint still block the app form.
-  const { hash } = (await rows<{ hash: string }>(env, 'SELECT email_hash AS hash FROM contacts'))[0];
-  await env.DB.prepare('DELETE FROM subscriptions').run();
-  await env.DB.prepare(`INSERT INTO suppressions (email_hash, scope, reason) VALUES (?, '*', 'bounce')`).bind(hash).run();
-  assert.deepEqual(await subscribe(env, appSignup), { ok: true });
-  assert.deepEqual(await rows(env, 'SELECT * FROM subscriptions'), []);
 });
 
 test('a bounced or complaining address is not signed up again', async () => {

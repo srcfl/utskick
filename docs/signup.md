@@ -15,7 +15,6 @@ Pick the first that fits. A browser form is the weakest: browsers send a true `O
 
 - The address goes on the list with the consent id, the time and the form's name as its source (`subscriptions.source`).
 - An address that is suppressed, for this list (someone who left) or for every list (a hard bounce, a spam complaint, or cleaned in Mailchimp), stays out; the sign-up is dropped. Without double opt-in a form cannot tell the person from someone typing their address, so someone who left and wants back writes to you until double opt-in exists.
-- Exception: the Sourceful app form (`sourceful-app`) signs the owner of the address in first. For that form only, a list-scoped `unsubscribe` is lifted and the address is signed up again. Bounce, complaint, Mailchimp-cleaned, and suppressions on every list (`*`) are never lifted.
 - The answer is the same in every case, so a form cannot be used to find out who is on a list.
 - A known reader keeps their first name and country, and an existing subscription keeps its consent id, time and source. Without double opt-in, anyone can type someone else's address into a form, and must not be able to change what that person agreed to.
 
