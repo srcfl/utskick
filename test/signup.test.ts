@@ -314,7 +314,7 @@ function unsubscribe(body: Record<string, string>, o: Options = {}) {
   return new Request('https://news.test/unsubscribe', { method: o.method ?? 'POST', headers, body: o.method === 'GET' ? undefined : JSON.stringify(body) });
 }
 
-test('a server form takes an address off one of its lists with its key, and cannot sign it up again', async () => {
+test('a server form takes an address off one of its lists with its key, and a new sign-up puts it back', async () => {
   const e = env();
   const off = { email: 'Reader@Example.com', list: 'the-source' };
   await handle(post(signup, { origin: null, key }), e);
@@ -333,9 +333,10 @@ test('a server form takes an address off one of its lists with its key, and cann
   // Off The Source only; still on FTW news.
   assert.deepEqual((await stored(e)).map(r => r.list), ['ftw-news']);
   assert.deepEqual(await rows(e, 'SELECT scope, reason FROM suppressions'), [{ scope: 'the-source', reason: 'unsubscribe' }]);
-  // The same form cannot put the address back: someone who left writes in.
+  // A new sign-up for the same list puts the address back.
   assert.equal((await handle(post(signup, { origin: null, key }), e)).status, 200);
-  assert.deepEqual((await stored(e)).map(r => r.list), ['ftw-news']);
+  assert.deepEqual((await stored(e)).map(r => r.list), ['ftw-news', 'the-source']);
+  assert.deepEqual(await rows(e, 'SELECT * FROM suppressions'), []);
   // An address that was never on the list gets the same answer.
   assert.deepEqual(await (await handle(unsubscribe({ ...off, email: 'stranger@example.com' }, { key }), e)).json(), { ok: true });
 });
